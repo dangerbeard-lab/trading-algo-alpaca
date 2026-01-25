@@ -1,1115 +1,771 @@
 #!/usr/bin/env python3
 """
-Enhanced Hybrid Trading Algorithm for Alpaca
-============================================
-Improvements implemented:
-1. Trailing stops (configurable % from peak)
-2. Volatility-adjusted position sizing (ATR-based)
-3. Correlation filtering (reduces exposure when positions correlate)
-4. ADX threshold hysteresis (separate entry/exit thresholds)
-5. Volume confirmation (requires above-average volume)
-6. Time-of-day filtering (avoids volatile open/close periods)
-7. Comprehensive logging and performance metrics
+Enhanced Trading Bot v2.0
+=========================
+Multi-asset hybrid strategy with critical fixes:
+- Lookahead bias fix (uses closed candles only)
+- State persistence (positions.json)
+- Fractional share support
+- 12% trailing stop (no fixed TP)
+- ATR-based position sizing (4-10%)
+- Limit orders for mean reversion
 """
 
 import os
 import json
 import logging
-import numpy as np
-import pandas as pd
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, field, asdict
-from collections import defaultdict
-import warnings
-warnings.filterwarnings('ignore')
+import pandas as pd
+import numpy as np
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, GetAssetsRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass
+from alpaca.trading.requests import (
+    MarketOrderRequest, LimitOrderRequest,
+    GetAssetsRequest, ClosePositionRequest
+)
+from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, AssetStatus
 from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('trading_bot.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+class PositionState:
+    """Manages persistent state for positions (survives restarts)."""
 
-@dataclass
-class TradingConfig:
-    """Central configuration for the trading algorithm."""
-    
-    # API Settings
-    api_key: str = ""
-    api_secret: str = ""
-    paper: bool = True
-    
-    # Instruments
-    crypto_symbols: List[str] = field(default_factory=lambda: ["BTC/USD"])
-    etf_symbols: List[str] = field(default_factory=lambda: ["SPY", "QQQ", "IWM"])
-    stock_symbols: List[str] = field(default_factory=lambda: [
-        "NVDA", "META", "AMZN", "GOOGL", "MSFT", 
-        "AAPL", "TSLA", "AMD", "NFLX", "AVGO", "MSTR"
-    ])
-    
-    # Position Sizing
-    base_position_pct: float = 0.10  # 10% base position size
-    max_positions: int = 8
-    max_portfolio_exposure: float = 0.80  # 80% max exposure
-    
-    # ATR-based position sizing
-    atr_period: int = 14
-    atr_target_risk: float = 0.02  # Target 2% risk per trade based on ATR
-    min_position_pct: float = 0.03  # Minimum 3% position
-    max_position_pct: float = 0.15  # Maximum 15% position
-    
-    # Risk Management
-    max_drawdown_pct: float = 0.10  # 10% max drawdown
-    take_profit_pct: float = 0.20  # 20% take profit
-    
-    # Trailing Stop Settings
-    trailing_stop_enabled: bool = True
-    trailing_stop_pct: float = 0.12  # 12% trailing stop from peak
-    trailing_stop_activation_pct: float = 0.05  # Activate after 5% profit
-    
-    # Technical Indicators
-    ema_fast: int = 9
-    ema_slow: int = 21
-    rsi_period: int = 14
-    rsi_oversold: int = 30
-    rsi_overbought: int = 70
-    bb_period: int = 20
-    bb_std: float = 2.0
-    macd_fast: int = 12
-    macd_slow: int = 26
-    macd_signal: int = 9
-    
-    # ADX Hysteresis Settings
-    adx_period: int = 14
-    adx_trending_entry: int = 25  # ADX above this = trending market
-    adx_trending_exit: int = 20   # ADX must fall below this to switch back
-    
-    # Volume Confirmation
-    volume_confirmation_enabled: bool = True
-    volume_period: int = 20
-    volume_multiplier: float = 1.2  # Require 1.2x average volume
-    
-    # Correlation Filtering
-    correlation_enabled: bool = True
-    correlation_lookback: int = 30  # Days for correlation calculation
-    correlation_threshold: float = 0.7  # High correlation threshold
-    max_correlated_positions: int = 3  # Max positions with high correlation
-    
-    # Time-of-Day Filtering (for equities)
-    time_filter_enabled: bool = True
-    market_open_buffer_minutes: int = 30  # Avoid first 30 mins
-    market_close_buffer_minutes: int = 30  # Avoid last 30 mins
-    
-    # Logging
-    log_file: str = "trading_bot.log"
-    metrics_file: str = "trading_metrics.json"
+    def __init__(self, filepath: str = "positions.json"):
+        self.filepath = filepath
+        self.positions: Dict[str, dict] = {}
+        self.load()
 
-
-# =============================================================================
-# PERFORMANCE METRICS TRACKING
-# =============================================================================
-
-@dataclass
-class TradeRecord:
-    """Record of a completed trade."""
-    symbol: str
-    side: str
-    entry_price: float
-    exit_price: float
-    entry_time: str
-    exit_time: str
-    quantity: float
-    pnl: float
-    pnl_pct: float
-    r_multiple: float  # Profit in terms of initial risk
-    regime: str  # trending or ranging
-    exit_reason: str  # take_profit, trailing_stop, signal_exit, etc.
-
-
-@dataclass
-class PositionTracker:
-    """Tracks open position with trailing stop logic."""
-    symbol: str
-    entry_price: float
-    entry_time: str
-    quantity: float
-    side: str  # 'long' or 'short'
-    peak_price: float  # Highest price since entry (for longs)
-    trough_price: float  # Lowest price since entry (for shorts)
-    initial_stop: float
-    regime: str
-    trailing_active: bool = False
-
-
-class MetricsTracker:
-    """Tracks and calculates trading performance metrics."""
-    
-    def __init__(self, config: TradingConfig):
-        self.config = config
-        self.trades: List[TradeRecord] = []
-        self.daily_returns: List[float] = []
-        self.peak_equity: float = 0
-        self.current_drawdown: float = 0
-        self.max_drawdown: float = 0
-        self.metrics_by_symbol: Dict[str, Dict] = defaultdict(lambda: {
-            'trades': 0, 'wins': 0, 'total_pnl': 0, 'total_r': 0
-        })
-        self.metrics_by_regime: Dict[str, Dict] = defaultdict(lambda: {
-            'trades': 0, 'wins': 0, 'total_pnl': 0
-        })
-        self._load_metrics()
-    
-    def _load_metrics(self):
-        """Load existing metrics from file."""
-        if os.path.exists(self.config.metrics_file):
+    def load(self):
+        """Load position state from disk."""
+        if os.path.exists(self.filepath):
             try:
-                with open(self.config.metrics_file, 'r') as f:
-                    data = json.load(f)
-                    self.trades = [TradeRecord(**t) for t in data.get('trades', [])]
-                    self.daily_returns = data.get('daily_returns', [])
-                    self.peak_equity = data.get('peak_equity', 0)
-                    self.max_drawdown = data.get('max_drawdown', 0)
-                    
-                    # Rebuild per-symbol and per-regime metrics
-                    for trade in self.trades:
-                        self._update_aggregates(trade)
-            except Exception as e:
-                logging.warning(f"Could not load metrics: {e}")
-    
-    def _update_aggregates(self, trade: TradeRecord):
-        """Update aggregate metrics from a trade."""
-        # Per-symbol
-        sym = self.metrics_by_symbol[trade.symbol]
-        sym['trades'] += 1
-        sym['wins'] += 1 if trade.pnl > 0 else 0
-        sym['total_pnl'] += trade.pnl
-        sym['total_r'] += trade.r_multiple
-        
-        # Per-regime
-        reg = self.metrics_by_regime[trade.regime]
-        reg['trades'] += 1
-        reg['wins'] += 1 if trade.pnl > 0 else 0
-        reg['total_pnl'] += trade.pnl
-    
-    def record_trade(self, trade: TradeRecord):
-        """Record a completed trade."""
-        self.trades.append(trade)
-        self._update_aggregates(trade)
-        self._save_metrics()
-        
-        logging.info(
-            f"TRADE CLOSED: {trade.symbol} | PnL: ${trade.pnl:.2f} ({trade.pnl_pct:.2%}) | "
-            f"R-Multiple: {trade.r_multiple:.2f} | Exit: {trade.exit_reason}"
-        )
-    
-    def update_equity(self, current_equity: float):
-        """Update equity tracking for drawdown calculation."""
-        if current_equity > self.peak_equity:
-            self.peak_equity = current_equity
-        
-        if self.peak_equity > 0:
-            self.current_drawdown = (self.peak_equity - current_equity) / self.peak_equity
-            if self.current_drawdown > self.max_drawdown:
-                self.max_drawdown = self.current_drawdown
-    
-    def add_daily_return(self, daily_return: float):
-        """Add a daily return for Sharpe calculation."""
-        self.daily_returns.append(daily_return)
-        self._save_metrics()
-    
-    def calculate_sharpe(self, risk_free_rate: float = 0.05) -> float:
-        """Calculate annualised Sharpe ratio."""
-        if len(self.daily_returns) < 2:
-            return 0.0
-        
-        returns = np.array(self.daily_returns)
-        excess_returns = returns - (risk_free_rate / 252)
-        
-        if np.std(excess_returns) == 0:
-            return 0.0
-        
-        return np.sqrt(252) * np.mean(excess_returns) / np.std(excess_returns)
-    
-    def get_summary(self) -> Dict:
-        """Get comprehensive performance summary."""
-        total_trades = len(self.trades)
-        if total_trades == 0:
-            return {'message': 'No trades recorded yet'}
-        
-        wins = sum(1 for t in self.trades if t.pnl > 0)
-        total_pnl = sum(t.pnl for t in self.trades)
-        avg_r = np.mean([t.r_multiple for t in self.trades])
-        
-        return {
-            'total_trades': total_trades,
-            'win_rate': wins / total_trades,
-            'total_pnl': total_pnl,
-            'average_r_multiple': avg_r,
-            'sharpe_ratio': self.calculate_sharpe(),
-            'max_drawdown': self.max_drawdown,
-            'current_drawdown': self.current_drawdown,
-            'by_symbol': dict(self.metrics_by_symbol),
-            'by_regime': dict(self.metrics_by_regime)
+                with open(self.filepath, 'r') as f:
+                    self.positions = json.load(f)
+                logger.info(f"Loaded {len(self.positions)} position states from {self.filepath}")
+            except (json.JSONDecodeError, IOError) as e:
+                logger.warning(f"Could not load positions file: {e}")
+                self.positions = {}
+        else:
+            logger.info("No existing positions file found, starting fresh")
+            self.positions = {}
+
+    def save(self):
+        """Save position state to disk immediately."""
+        try:
+            with open(self.filepath, 'w') as f:
+                json.dump(self.positions, f, indent=2, default=str)
+        except IOError as e:
+            logger.error(f"Failed to save positions file: {e}")
+
+    def update_position(self, symbol: str, entry_price: float, entry_time: datetime,
+                        peak_price: float, current_price: float):
+        """Update or create position state and save immediately."""
+        new_peak = max(peak_price, current_price)
+
+        self.positions[symbol] = {
+            'entry_price': entry_price,
+            'entry_time': entry_time.isoformat() if isinstance(entry_time, datetime) else entry_time,
+            'peak_price': new_peak,
+            'highest_watermark': new_peak,
+            'last_updated': datetime.now().isoformat()
         }
-    
-    def _save_metrics(self):
-        """Save metrics to file."""
-        data = {
-            'trades': [asdict(t) for t in self.trades],
-            'daily_returns': self.daily_returns,
-            'peak_equity': self.peak_equity,
-            'max_drawdown': self.max_drawdown,
-            'summary': self.get_summary()
-        }
-        with open(self.config.metrics_file, 'w') as f:
-            json.dump(data, f, indent=2, default=str)
+        self.save()  # Persist immediately
+
+    def get_position(self, symbol: str) -> Optional[dict]:
+        """Get position state if exists."""
+        return self.positions.get(symbol)
+
+    def remove_position(self, symbol: str):
+        """Remove position state and save."""
+        if symbol in self.positions:
+            del self.positions[symbol]
+            self.save()
+
+    def get_peak_price(self, symbol: str, current_price: float) -> float:
+        """Get peak price for trailing stop calculation."""
+        pos = self.positions.get(symbol)
+        if pos:
+            return max(pos.get('peak_price', current_price), current_price)
+        return current_price
 
 
-# =============================================================================
-# CORRELATION MANAGER
-# =============================================================================
+class TechnicalIndicators:
+    """Calculate technical indicators for signal generation."""
 
-class CorrelationManager:
-    """Manages correlation calculations and filtering."""
-    
-    def __init__(self, config: TradingConfig):
-        self.config = config
-        self.correlation_matrix: Optional[pd.DataFrame] = None
-        self.last_update: Optional[datetime] = None
-    
-    def update_correlations(self, price_data: Dict[str, pd.DataFrame]):
-        """Update correlation matrix from recent price data."""
-        if not self.config.correlation_enabled:
-            return
-        
-        # Build returns DataFrame
-        returns_dict = {}
-        for symbol, df in price_data.items():
-            if len(df) >= self.config.correlation_lookback:
-                returns_dict[symbol] = df['close'].pct_change().dropna().tail(
-                    self.config.correlation_lookback
-                )
-        
-        if len(returns_dict) < 2:
-            return
-        
-        returns_df = pd.DataFrame(returns_dict).dropna()
-        if len(returns_df) >= 10:
-            self.correlation_matrix = returns_df.corr()
-            self.last_update = datetime.now()
-            logging.debug(f"Updated correlation matrix for {len(returns_dict)} symbols")
-    
-    def get_correlated_symbols(self, symbol: str, current_positions: List[str]) -> List[str]:
-        """Get list of current positions highly correlated with symbol."""
-        if self.correlation_matrix is None or symbol not in self.correlation_matrix.columns:
-            return []
-        
-        correlated = []
-        for pos_symbol in current_positions:
-            if pos_symbol in self.correlation_matrix.columns and pos_symbol != symbol:
-                corr = abs(self.correlation_matrix.loc[symbol, pos_symbol])
-                if corr >= self.config.correlation_threshold:
-                    correlated.append(pos_symbol)
-        
-        return correlated
-    
-    def can_open_position(self, symbol: str, current_positions: List[str]) -> Tuple[bool, str]:
-        """Check if opening a position would violate correlation limits."""
-        if not self.config.correlation_enabled:
-            return True, ""
-        
-        correlated = self.get_correlated_symbols(symbol, current_positions)
-        
-        if len(correlated) >= self.config.max_correlated_positions:
-            return False, f"Would exceed correlated position limit (correlated with: {correlated})"
-        
-        return True, ""
+    @staticmethod
+    def ema(series: pd.Series, period: int) -> pd.Series:
+        return series.ewm(span=period, adjust=False).mean()
 
+    @staticmethod
+    def sma(series: pd.Series, period: int) -> pd.Series:
+        return series.rolling(window=period).mean()
 
-# =============================================================================
-# MAIN TRADING BOT
-# =============================================================================
+    @staticmethod
+    def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+        delta = series.diff()
+        gain = delta.where(delta > 0, 0).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / (loss + 1e-10)
+        return 100 - (100 / (1 + rs))
+
+    @staticmethod
+    def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+        ema_fast = series.ewm(span=fast, adjust=False).mean()
+        ema_slow = series.ewm(span=slow, adjust=False).mean()
+        macd_line = ema_fast - ema_slow
+        signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+        histogram = macd_line - signal_line
+        return macd_line, signal_line, histogram
+
+    @staticmethod
+    def bollinger_bands(series: pd.Series, period: int = 20, std_dev: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
+        sma = series.rolling(window=period).mean()
+        std = series.rolling(window=period).std()
+        upper = sma + (std * std_dev)
+        lower = sma - (std * std_dev)
+        return upper, sma, lower
+
+    @staticmethod
+    def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+        tr1 = high - low
+        tr2 = (high - close.shift()).abs()
+        tr3 = (low - close.shift()).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        return tr.rolling(window=period).mean()
+
+    @staticmethod
+    def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+        tr = pd.concat([
+            high - low,
+            (high - close.shift()).abs(),
+            (low - close.shift()).abs()
+        ], axis=1).max(axis=1)
+
+        atr = tr.rolling(window=period).mean()
+
+        up_move = high.diff()
+        down_move = -low.diff()
+
+        plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0)
+        minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0)
+
+        plus_di = 100 * plus_dm.rolling(period).mean() / (atr + 1e-10)
+        minus_di = 100 * minus_dm.rolling(period).mean() / (atr + 1e-10)
+
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10)
+        adx = dx.rolling(period).mean()
+
+        return adx.fillna(20)
+
 
 class EnhancedTradingBot:
-    """Enhanced hybrid trading algorithm with all improvements."""
-    
-    def __init__(self, config: TradingConfig):
-        self.config = config
-        self._setup_logging()
-        
-        # API clients
-        self.trading_client = TradingClient(
-            config.api_key, 
-            config.api_secret, 
-            paper=config.paper
+    """
+    Multi-asset hybrid trading bot with:
+    - Trend following (EMA crossover + MACD + ADX)
+    - Mean reversion (Bollinger Bands + RSI)
+    - 12% trailing stop (no fixed TP)
+    - ATR-based position sizing (4-10%)
+    - State persistence for restarts
+    """
+
+    def __init__(self, config_path: str = "config.json"):
+        # Load configuration
+        with open(config_path, 'r') as f:
+            self.config = json.load(f)
+
+        # API credentials from environment
+        api_key = os.environ.get('ALPACA_API_KEY')
+        secret_key = os.environ.get('ALPACA_SECRET_KEY')
+
+        if not api_key or not secret_key:
+            raise ValueError("ALPACA_API_KEY and ALPACA_SECRET_KEY must be set")
+
+        # Initialize clients
+        self.trading_client = TradingClient(api_key, secret_key, paper=self.config.get('paper_trading', True))
+        self.stock_data_client = StockHistoricalDataClient(api_key, secret_key)
+        self.crypto_data_client = CryptoHistoricalDataClient(api_key, secret_key)
+
+        # Position state persistence
+        self.position_state = PositionState(
+            self.config['persistence'].get('positions_file', 'positions.json')
         )
-        self.stock_client = StockHistoricalDataClient(config.api_key, config.api_secret)
-        self.crypto_client = CryptoHistoricalDataClient(config.api_key, config.api_secret)
-        
-        # State tracking
-        self.positions: Dict[str, PositionTracker] = {}
-        self.regime_state: Dict[str, str] = {}  # 'trending' or 'ranging'
-        self.metrics = MetricsTracker(config)
-        self.correlation_manager = CorrelationManager(config)
-        
-        # All symbols
-        self.all_equity_symbols = config.etf_symbols + config.stock_symbols
-        self.all_symbols = config.crypto_symbols + self.all_equity_symbols
-        
-        logging.info("Enhanced Trading Bot initialised")
-        logging.info(f"Trading {len(self.all_symbols)} instruments")
-    
-    def _setup_logging(self):
-        """Configure logging."""
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s | %(levelname)s | %(message)s',
-            handlers=[
-                logging.FileHandler(self.config.log_file),
-                logging.StreamHandler()
-            ]
-        )
-    
-    # -------------------------------------------------------------------------
-    # Data Fetching
-    # -------------------------------------------------------------------------
-    
-    def fetch_stock_data(self, symbol: str, days: int = 60) -> Optional[pd.DataFrame]:
-        """Fetch historical stock/ETF data."""
+
+        # Build watchlist
+        self.watchlist = self._build_watchlist()
+
+        # Separate crypto and equity symbols
+        self.crypto_symbols = [s for s in self.watchlist if '/' in s]
+        self.equity_symbols = [s for s in self.watchlist if '/' not in s]
+
+        logger.info(f"Initialized bot with {len(self.watchlist)} symbols")
+        logger.info(f"  Crypto: {len(self.crypto_symbols)}, Equities: {len(self.equity_symbols)}")
+
+    def _build_watchlist(self) -> List[str]:
+        """Flatten watchlist from config."""
+        watchlist = []
+        for category, symbols in self.config['watchlist'].items():
+            watchlist.extend(symbols)
+        return watchlist
+
+    def get_account(self) -> dict:
+        """Get account information."""
+        account = self.trading_client.get_account()
+        return {
+            'equity': float(account.equity),
+            'cash': float(account.cash),
+            'buying_power': float(account.buying_power),
+            'portfolio_value': float(account.portfolio_value)
+        }
+
+    def get_positions(self) -> Dict[str, dict]:
+        """Get current positions."""
+        positions = self.trading_client.get_all_positions()
+        return {
+            p.symbol: {
+                'qty': float(p.qty),
+                'avg_entry_price': float(p.avg_entry_price),
+                'current_price': float(p.current_price),
+                'market_value': float(p.market_value),
+                'unrealized_pl': float(p.unrealized_pl),
+                'unrealized_plpc': float(p.unrealized_plpc)
+            }
+            for p in positions
+        }
+
+    def get_pending_orders(self) -> set:
+        """Get symbols with pending (unfilled) orders."""
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+
         try:
-            request = StockBarsRequest(
-                symbol_or_symbols=symbol,
-                timeframe=TimeFrame.Hour,
-                start=datetime.now() - timedelta(days=days),
-                feed='iex'
-            )
-            bars = self.stock_client.get_stock_bars(request)
-            
-            if symbol not in bars.data or len(bars.data[symbol]) == 0:
-                return None
-            
-            df = pd.DataFrame([{
-                'timestamp': bar.timestamp,
-                'open': bar.open,
-                'high': bar.high,
-                'low': bar.low,
-                'close': bar.close,
-                'volume': bar.volume
-            } for bar in bars.data[symbol]])
-            
-            df.set_index('timestamp', inplace=True)
-            return df
-            
+            request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            orders = self.trading_client.get_orders(request)
+            symbols = set()
+            for order in orders:
+                symbols.add(order.symbol)
+            if symbols:
+                logger.info(f"Found pending orders for: {symbols}")
+            return symbols
         except Exception as e:
-            logging.error(f"Error fetching stock data for {symbol}: {e}")
-            return None
-    
-    def fetch_crypto_data(self, symbol: str, days: int = 60) -> Optional[pd.DataFrame]:
-        """Fetch historical crypto data."""
+            logger.warning(f"Failed to get pending orders: {e}")
+            return set()
+
+
+    def get_bars(self, symbol: str, timeframe: str = "15Min", limit: int = 100) -> Optional[pd.DataFrame]:
+        """Fetch historical bars for a symbol."""
         try:
-            request = CryptoBarsRequest(
-                symbol_or_symbols=symbol,
-                timeframe=TimeFrame.Hour,
-                start=datetime.now() - timedelta(days=days)
-            )
-            bars = self.crypto_client.get_crypto_bars(request)
-            
-            if symbol not in bars.data or len(bars.data[symbol]) == 0:
+            tf_map = {
+                "1Min": TimeFrame.Minute,
+                "5Min": TimeFrame(5, TimeFrameUnit.Minute),
+                "15Min": TimeFrame(15, TimeFrameUnit.Minute),
+                "30Min": TimeFrame(30, TimeFrameUnit.Minute),
+                "1Hour": TimeFrame.Hour,
+                "1Day": TimeFrame.Day
+            }
+            tf = tf_map.get(timeframe, TimeFrame(15, TimeFrameUnit.Minute))
+
+            end = datetime.now()
+            start = end - timedelta(days=10)  # Enough for 100 bars
+
+            if '/' in symbol:  # Crypto
+                request = CryptoBarsRequest(
+                    symbol_or_symbols=symbol,
+                    timeframe=tf,
+                    start=start,
+                    end=end,
+                    limit=limit
+                )
+                bars = self.crypto_data_client.get_crypto_bars(request)
+            else:  # Equity
+                request = StockBarsRequest(
+                    symbol_or_symbols=symbol,
+                    timeframe=tf,
+                    start=start,
+                    end=end,
+                    limit=limit,
+                    feed=self.config['execution'].get('data_feed', 'iex')  # Explicit IEX feed
+                )
+                bars = self.stock_data_client.get_stock_bars(request)
+
+            if len(bars.df) == 0:
                 return None
-            
-            df = pd.DataFrame([{
-                'timestamp': bar.timestamp,
-                'open': bar.open,
-                'high': bar.high,
-                'low': bar.low,
-                'close': bar.close,
-                'volume': bar.volume
-            } for bar in bars.data[symbol]])
-            
-            df.set_index('timestamp', inplace=True)
+
+            df = bars.df.reset_index()
+            df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume', 'trade_count', 'vwap']]
             return df
-            
+
         except Exception as e:
-            logging.error(f"Error fetching crypto data for {symbol}: {e}")
+            logger.warning(f"Failed to fetch bars for {symbol}: {e}")
             return None
-    
-    def fetch_all_data(self) -> Dict[str, pd.DataFrame]:
-        """Fetch data for all symbols."""
-        data = {}
-        
-        for symbol in self.config.crypto_symbols:
-            df = self.fetch_crypto_data(symbol)
-            if df is not None:
-                data[symbol] = df
-        
-        for symbol in self.all_equity_symbols:
-            df = self.fetch_stock_data(symbol)
-            if df is not None:
-                data[symbol] = df
-        
-        return data
-    
-    # -------------------------------------------------------------------------
-    # Technical Indicators
-    # -------------------------------------------------------------------------
-    
+
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate all technical indicators."""
+        """Add all technical indicators to dataframe."""
+        cfg = self.config['strategy']
+
         df = df.copy()
-        
+
         # EMAs
-        df['ema_fast'] = df['close'].ewm(span=self.config.ema_fast, adjust=False).mean()
-        df['ema_slow'] = df['close'].ewm(span=self.config.ema_slow, adjust=False).mean()
-        
-        # RSI
-        delta = df['close'].diff()
-        gain = delta.where(delta > 0, 0).rolling(window=self.config.rsi_period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=self.config.rsi_period).mean()
-        rs = gain / loss.replace(0, np.nan)
-        df['rsi'] = 100 - (100 / (1 + rs))
-        
-        # Bollinger Bands
-        df['bb_middle'] = df['close'].rolling(window=self.config.bb_period).mean()
-        bb_std = df['close'].rolling(window=self.config.bb_period).std()
-        df['bb_upper'] = df['bb_middle'] + (self.config.bb_std * bb_std)
-        df['bb_lower'] = df['bb_middle'] - (self.config.bb_std * bb_std)
-        
+        df['ema_short'] = TechnicalIndicators.ema(df['close'], cfg['ema_short'])
+        df['ema_long'] = TechnicalIndicators.ema(df['close'], cfg['ema_long'])
+
         # MACD
-        ema_fast = df['close'].ewm(span=self.config.macd_fast, adjust=False).mean()
-        ema_slow = df['close'].ewm(span=self.config.macd_slow, adjust=False).mean()
-        df['macd'] = ema_fast - ema_slow
-        df['macd_signal'] = df['macd'].ewm(span=self.config.macd_signal, adjust=False).mean()
-        df['macd_hist'] = df['macd'] - df['macd_signal']
-        
+        df['macd'], df['macd_signal'], df['macd_hist'] = TechnicalIndicators.macd(
+            df['close'], cfg['macd_fast'], cfg['macd_slow'], cfg['macd_signal']
+        )
+
+        # RSI
+        df['rsi'] = TechnicalIndicators.rsi(df['close'], cfg['rsi_period'])
+
+        # Bollinger Bands
+        df['bb_upper'], df['bb_middle'], df['bb_lower'] = TechnicalIndicators.bollinger_bands(
+            df['close'], cfg['bollinger_period'], cfg['bollinger_std']
+        )
+
         # ADX
-        df = self._calculate_adx(df)
-        
+        df['adx'] = TechnicalIndicators.adx(df['high'], df['low'], df['close'], cfg['adx_period'])
+
         # ATR
-        df = self._calculate_atr(df)
-        
-        # Volume metrics
-        df['volume_sma'] = df['volume'].rolling(window=self.config.volume_period).mean()
-        df['volume_ratio'] = df['volume'] / df['volume_sma']
-        
+        df['atr'] = TechnicalIndicators.atr(df['high'], df['low'], df['close'], cfg['atr_period'])
+
+        # Volume MA
+        df['volume_ma'] = TechnicalIndicators.sma(df['volume'], cfg['volume_ma_period'])
+        df['volume_ratio'] = df['volume'] / (df['volume_ma'] + 1e-10)
+
         return df
-    
-    def _calculate_adx(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate ADX indicator."""
-        high = df['high']
-        low = df['low']
-        close = df['close']
-        
-        plus_dm = high.diff()
-        minus_dm = low.diff().abs() * -1
-        
-        plus_dm = plus_dm.where((plus_dm > minus_dm.abs()) & (plus_dm > 0), 0)
-        minus_dm = minus_dm.abs().where((minus_dm.abs() > plus_dm) & (minus_dm < 0), 0)
-        
-        tr = pd.concat([
-            high - low,
-            (high - close.shift()).abs(),
-            (low - close.shift()).abs()
-        ], axis=1).max(axis=1)
-        
-        atr = tr.rolling(window=self.config.adx_period).mean()
-        
-        plus_di = 100 * (plus_dm.rolling(window=self.config.adx_period).mean() / atr)
-        minus_di = 100 * (minus_dm.rolling(window=self.config.adx_period).mean() / atr)
-        
-        dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan))
-        df['adx'] = dx.rolling(window=self.config.adx_period).mean()
-        df['plus_di'] = plus_di
-        df['minus_di'] = minus_di
-        
-        return df
-    
-    def _calculate_atr(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate Average True Range."""
-        high = df['high']
-        low = df['low']
-        close = df['close']
-        
-        tr = pd.concat([
-            high - low,
-            (high - close.shift()).abs(),
-            (low - close.shift()).abs()
-        ], axis=1).max(axis=1)
-        
-        df['atr'] = tr.rolling(window=self.config.atr_period).mean()
-        df['atr_pct'] = df['atr'] / df['close']  # ATR as percentage of price
-        
-        return df
-    
-    # -------------------------------------------------------------------------
-    # Regime Detection with Hysteresis
-    # -------------------------------------------------------------------------
-    
-    def determine_regime(self, symbol: str, adx: float) -> str:
+
+    def generate_signal(self, df: pd.DataFrame, symbol: str) -> dict:
         """
-        Determine market regime with hysteresis to prevent whipsawing.
-        Uses separate entry/exit thresholds.
+        Generate trading signal using CLOSED candles only (fix lookahead bias).
+        Uses .iloc[-2] for the last CLOSED candle, not .iloc[-1] (forming candle).
         """
-        current_regime = self.regime_state.get(symbol, 'ranging')
-        
-        if current_regime == 'ranging':
-            # Need ADX above entry threshold to switch to trending
-            if adx >= self.config.adx_trending_entry:
-                new_regime = 'trending'
-                logging.info(f"{symbol}: Regime change RANGING -> TRENDING (ADX: {adx:.1f})")
-            else:
-                new_regime = 'ranging'
-        else:  # currently trending
-            # Need ADX below exit threshold to switch back to ranging
-            if adx < self.config.adx_trending_exit:
-                new_regime = 'ranging'
-                logging.info(f"{symbol}: Regime change TRENDING -> RANGING (ADX: {adx:.1f})")
-            else:
-                new_regime = 'trending'
-        
-        self.regime_state[symbol] = new_regime
-        return new_regime
-    
-    # -------------------------------------------------------------------------
-    # Signal Generation
-    # -------------------------------------------------------------------------
-    
-    def generate_signal(self, symbol: str, df: pd.DataFrame) -> Optional[str]:
-        """Generate trading signal based on regime and indicators."""
-        if len(df) < 50:
-            return None
-        
-        latest = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        # Check volume confirmation
-        if self.config.volume_confirmation_enabled:
-            if latest['volume_ratio'] < self.config.volume_multiplier:
-                logging.debug(f"{symbol}: Volume too low ({latest['volume_ratio']:.2f}x avg)")
-                return None
-        
-        # Check time-of-day filter for equities
-        if symbol in self.all_equity_symbols and self.config.time_filter_enabled:
-            if not self._is_valid_trading_time():
-                return None
-        
-        # Determine regime
-        regime = self.determine_regime(symbol, latest['adx'])
-        
-        if regime == 'trending':
-            return self._trending_signal(symbol, latest, prev)
-        else:
-            return self._ranging_signal(symbol, latest, prev)
-    
-    def _trending_signal(self, symbol: str, latest: pd.Series, prev: pd.Series) -> Optional[str]:
-        """Generate signal for trending market (EMA crossover + MACD confirmation)."""
-        # EMA crossover
-        ema_cross_up = (prev['ema_fast'] <= prev['ema_slow']) and (latest['ema_fast'] > latest['ema_slow'])
-        ema_cross_down = (prev['ema_fast'] >= prev['ema_slow']) and (latest['ema_fast'] < latest['ema_slow'])
-        
-        # MACD confirmation
-        macd_bullish = latest['macd'] > latest['macd_signal'] and latest['macd_hist'] > 0
-        macd_bearish = latest['macd'] < latest['macd_signal'] and latest['macd_hist'] < 0
-        
-        # Directional movement confirmation
-        di_bullish = latest['plus_di'] > latest['minus_di']
-        di_bearish = latest['minus_di'] > latest['plus_di']
-        
-        if ema_cross_up and macd_bullish and di_bullish:
-            logging.info(f"{symbol} [TRENDING]: BUY signal - EMA crossover + MACD + DI confirm")
-            return 'buy'
-        elif ema_cross_down and macd_bearish and di_bearish:
-            logging.info(f"{symbol} [TRENDING]: SELL signal - EMA crossover + MACD + DI confirm")
-            return 'sell'
-        
-        return None
-    
-    def _ranging_signal(self, symbol: str, latest: pd.Series, prev: pd.Series) -> Optional[str]:
-        """Generate signal for ranging market (RSI + Bollinger Bands mean reversion)."""
-        # RSI conditions
-        rsi_oversold = latest['rsi'] < self.config.rsi_oversold
-        rsi_overbought = latest['rsi'] > self.config.rsi_overbought
-        
-        # Bollinger Band conditions
-        price_below_lower = latest['close'] < latest['bb_lower']
-        price_above_upper = latest['close'] > latest['bb_upper']
-        
-        # RSI turning (momentum shift)
-        rsi_turning_up = prev['rsi'] < latest['rsi'] and latest['rsi'] < 40
-        rsi_turning_down = prev['rsi'] > latest['rsi'] and latest['rsi'] > 60
-        
-        if rsi_oversold and price_below_lower and rsi_turning_up:
-            logging.info(f"{symbol} [RANGING]: BUY signal - RSI oversold + below BB lower")
-            return 'buy'
-        elif rsi_overbought and price_above_upper and rsi_turning_down:
-            logging.info(f"{symbol} [RANGING]: SELL signal - RSI overbought + above BB upper")
-            return 'sell'
-        
-        return None
-    
-    def _is_valid_trading_time(self) -> bool:
-        """Check if current time is within valid trading window (avoids open/close)."""
-        now = datetime.now()
-        current_time = now.time()
-        
-        # Market hours: 9:30 AM - 4:00 PM ET
-        market_open = time(9, 30)
-        market_close = time(16, 0)
-        
-        # Buffer periods
-        open_buffer_end = time(
-            9, 30 + self.config.market_open_buffer_minutes
-        )
-        close_buffer_start = time(
-            16 - (self.config.market_close_buffer_minutes // 60),
-            60 - (self.config.market_close_buffer_minutes % 60) if self.config.market_close_buffer_minutes % 60 != 0 else 0
-        )
-        
-        # Simplified: avoid first and last 30 minutes
-        if current_time < open_buffer_end:
-            logging.debug("Skipping trade: within market open buffer")
-            return False
-        if current_time > time(15, 30):  # After 3:30 PM
-            logging.debug("Skipping trade: within market close buffer")
-            return False
-        
-        return True
-    
-    # -------------------------------------------------------------------------
-    # Position Sizing (Volatility-Adjusted)
-    # -------------------------------------------------------------------------
-    
+        if len(df) < 3:
+            return {'signal': 'HOLD', 'reason': 'Insufficient data'}
+
+        cfg = self.config['strategy']
+
+        # CRITICAL FIX: Use .iloc[-2] for closed candle (not -1 which is forming)
+        current = df.iloc[-2]  # Last CLOSED candle
+        previous = df.iloc[-3]  # Previous closed candle
+
+        signal = {'signal': 'HOLD', 'reason': '', 'order_type': 'market', 'limit_price': None}
+
+        # Check regime
+        adx = current['adx']
+        is_trending = adx > cfg['adx_trending_threshold']
+        is_ranging = adx < cfg['adx_ranging_threshold']
+
+        # Volume confirmation
+        volume_confirmed = current['volume_ratio'] > cfg['volume_confirmation_multiplier']
+
+        # ========== TRENDING REGIME: EMA Crossover + MACD ==========
+        if is_trending:
+            # Bullish: EMA9 crosses above EMA21, MACD confirms
+            ema_cross_up = (
+                previous['ema_short'] <= previous['ema_long'] and
+                current['ema_short'] > current['ema_long']
+            )
+            macd_bullish = current['macd'] > current['macd_signal']
+
+            if ema_cross_up and macd_bullish and volume_confirmed:
+                signal = {
+                    'signal': 'BUY',
+                    'reason': f'Trending BUY: EMA crossover + MACD (ADX={adx:.1f})',
+                    'order_type': 'market',
+                    'limit_price': None
+                }
+
+            # Bearish: EMA9 crosses below EMA21
+            ema_cross_down = (
+                previous['ema_short'] >= previous['ema_long'] and
+                current['ema_short'] < current['ema_long']
+            )
+            macd_bearish = current['macd'] < current['macd_signal']
+
+            if ema_cross_down and macd_bearish:
+                signal = {
+                    'signal': 'SELL',
+                    'reason': f'Trending SELL: EMA crossover + MACD (ADX={adx:.1f})',
+                    'order_type': 'market',
+                    'limit_price': None
+                }
+
+        # ========== RANGING REGIME: Mean Reversion with Limit Orders ==========
+        elif is_ranging:
+            rsi = current['rsi']
+
+            # Oversold at lower Bollinger Band - use LIMIT ORDER
+            if rsi < cfg['rsi_oversold'] and current['close'] <= current['bb_lower']:
+                signal = {
+                    'signal': 'BUY',
+                    'reason': f'Mean Reversion BUY: RSI={rsi:.1f}, at BB lower (ADX={adx:.1f})',
+                    'order_type': 'limit',
+                    'limit_price': current['bb_lower']  # Limit at BB lower
+                }
+
+            # Overbought at upper Bollinger Band
+            elif rsi > cfg['rsi_overbought'] and current['close'] >= current['bb_upper']:
+                signal = {
+                    'signal': 'SELL',
+                    'reason': f'Mean Reversion SELL: RSI={rsi:.1f}, at BB upper (ADX={adx:.1f})',
+                    'order_type': 'market',
+                    'limit_price': None
+                }
+
+        return signal
+
     def calculate_position_size(self, symbol: str, df: pd.DataFrame, account_value: float) -> float:
         """
-        Calculate position size adjusted for volatility (ATR-based).
-        Higher volatility = smaller position size.
+        Calculate position size using ATR-based scaling.
+        - Low volatility stocks: up to max_position_pct (10%)
+        - High volatility stocks: near base_position_pct (4%)
         """
-        if len(df) < self.config.atr_period:
-            return account_value * self.config.base_position_pct
-        
-        latest = df.iloc[-1]
-        atr_pct = latest['atr_pct']
-        
-        if pd.isna(atr_pct) or atr_pct <= 0:
-            return account_value * self.config.base_position_pct
-        
-        # Target risk-based position sizing
-        # If ATR is 2% and we want 2% risk, position = 100%
-        # If ATR is 4% and we want 2% risk, position = 50%
-        raw_position_pct = self.config.atr_target_risk / atr_pct
-        
-        # Clamp to min/max bounds
-        position_pct = max(
-            self.config.min_position_pct,
-            min(self.config.max_position_pct, raw_position_pct)
-        )
-        
+        cfg = self.config['risk_management']
+
+        base_pct = cfg['base_position_pct']  # 4%
+        max_pct = cfg['max_position_pct']    # 10%
+
+        # Get ATR from closed candle
+        current = df.iloc[-2]
+        atr = current['atr']
+        price = current['close']
+
+        if pd.isna(atr) or atr <= 0 or price <= 0:
+            return account_value * base_pct
+
+        # ATR as percentage of price
+        atr_pct = atr / price
+
+        # Scale position size inversely with volatility
+        # Lower volatility = larger position (up to max_pct)
+        # Higher volatility = smaller position (down to base_pct)
+
+        # Typical ATR% ranges: 0.5% (low vol) to 5% (high vol like BTC)
+        # Map this to position size
+        if atr_pct <= 0.01:  # Very low vol (<1%)
+            position_pct = max_pct
+        elif atr_pct >= 0.04:  # High vol (>4%)
+            position_pct = base_pct
+        else:
+            # Linear interpolation between base and max
+            vol_range = 0.04 - 0.01
+            vol_position = (atr_pct - 0.01) / vol_range
+            position_pct = max_pct - (vol_position * (max_pct - base_pct))
+
         position_value = account_value * position_pct
-        
-        logging.debug(
-            f"{symbol}: ATR={atr_pct:.2%}, Raw size={raw_position_pct:.2%}, "
-            f"Clamped={position_pct:.2%}, Value=${position_value:.2f}"
-        )
-        
+
+        logger.debug(f"{symbol}: ATR%={atr_pct:.2%}, Position={position_pct:.1%} (${position_value:,.0f})")
+
         return position_value
-    
-    # -------------------------------------------------------------------------
-    # Trailing Stop Management
-    # -------------------------------------------------------------------------
-    
-    def update_trailing_stops(self, current_prices: Dict[str, float]) -> List[str]:
+
+    def check_trailing_stop(self, symbol: str, current_price: float, position: dict) -> bool:
         """
-        Update trailing stops and return list of symbols to close.
+        Check if trailing stop is hit (12% from peak).
+        Updates peak price in persistent state.
         """
-        symbols_to_close = []
-        
-        for symbol, position in self.positions.items():
-            if symbol not in current_prices:
-                continue
-            
-            current_price = current_prices[symbol]
-            
-            if position.side == 'long':
-                # Update peak price
-                if current_price > position.peak_price:
-                    position.peak_price = current_price
-                
-                # Check if trailing stop should activate
-                profit_pct = (current_price - position.entry_price) / position.entry_price
-                if profit_pct >= self.config.trailing_stop_activation_pct:
-                    position.trailing_active = True
-                
-                # Check trailing stop hit
-                if position.trailing_active and self.config.trailing_stop_enabled:
-                    trailing_stop_price = position.peak_price * (1 - self.config.trailing_stop_pct)
-                    if current_price <= trailing_stop_price:
-                        logging.info(
-                            f"{symbol}: Trailing stop triggered at ${current_price:.2f} "
-                            f"(peak: ${position.peak_price:.2f}, stop: ${trailing_stop_price:.2f})"
-                        )
-                        symbols_to_close.append(symbol)
-                        continue
-                
-                # Check take profit
-                if profit_pct >= self.config.take_profit_pct:
-                    logging.info(f"{symbol}: Take profit triggered at {profit_pct:.2%}")
-                    symbols_to_close.append(symbol)
-                    continue
-                
-                # Check initial stop loss
-                loss_pct = (position.entry_price - current_price) / position.entry_price
-                if loss_pct >= self.config.max_drawdown_pct:
-                    logging.info(f"{symbol}: Stop loss triggered at {loss_pct:.2%}")
-                    symbols_to_close.append(symbol)
-        
-        return symbols_to_close
-    
-    # -------------------------------------------------------------------------
-    # Order Execution
-    # -------------------------------------------------------------------------
-    
-    def execute_buy(self, symbol: str, quantity: float, regime: str) -> bool:
-        """Execute a buy order."""
-        try:
-            # Determine if crypto or equity
-            is_crypto = symbol in self.config.crypto_symbols
-            
-            order_request = MarketOrderRequest(
-                symbol=symbol.replace("/", "") if is_crypto else symbol,
-                qty=quantity if is_crypto else int(quantity),
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.GTC if is_crypto else TimeInForce.DAY
-            )
-            
-            order = self.trading_client.submit_order(order_request)
-            
-            logging.info(f"BUY ORDER submitted: {symbol} x {quantity}")
-            
-            return True
-            
-        except Exception as e:
-            logging.error(f"Error executing buy for {symbol}: {e}")
-            return False
-    
-    def execute_sell(self, symbol: str, quantity: float) -> bool:
-        """Execute a sell order."""
-        try:
-            is_crypto = symbol in self.config.crypto_symbols
-            
-            order_request = MarketOrderRequest(
-                symbol=symbol.replace("/", "") if is_crypto else symbol,
-                qty=quantity if is_crypto else int(quantity),
-                side=OrderSide.SELL,
-                time_in_force=TimeInForce.GTC if is_crypto else TimeInForce.DAY
-            )
-            
-            order = self.trading_client.submit_order(order_request)
-            
-            logging.info(f"SELL ORDER submitted: {symbol} x {quantity}")
-            
-            return True
-            
-        except Exception as e:
-            logging.error(f"Error executing sell for {symbol}: {e}")
-            return False
-    
-    def close_position(self, symbol: str, reason: str, current_price: float) -> bool:
-        """Close a position and record the trade."""
-        if symbol not in self.positions:
-            return False
-        
-        position = self.positions[symbol]
-        
-        # Execute the close
-        success = self.execute_sell(symbol, position.quantity)
-        
-        if success:
-            # Calculate PnL
-            pnl = (current_price - position.entry_price) * position.quantity
-            pnl_pct = (current_price - position.entry_price) / position.entry_price
-            
-            # Calculate R-multiple (profit relative to initial risk)
-            initial_risk = position.entry_price - position.initial_stop
-            if initial_risk > 0:
-                r_multiple = (current_price - position.entry_price) / initial_risk
-            else:
-                r_multiple = pnl_pct / self.config.max_drawdown_pct
-            
-            # Record the trade
-            trade = TradeRecord(
+        cfg = self.config['risk_management']
+        trailing_stop_pct = cfg['trailing_stop_pct']  # 0.12 = 12%
+
+        entry_price = position['avg_entry_price']
+
+        # Get or initialize peak price from persistent state
+        peak_price = self.position_state.get_peak_price(symbol, current_price)
+
+        # Update peak if current price is higher
+        if current_price > peak_price:
+            peak_price = current_price
+            self.position_state.update_position(
                 symbol=symbol,
-                side=position.side,
-                entry_price=position.entry_price,
-                exit_price=current_price,
-                entry_time=position.entry_time,
-                exit_time=datetime.now().isoformat(),
-                quantity=position.quantity,
-                pnl=pnl,
-                pnl_pct=pnl_pct,
-                r_multiple=r_multiple,
-                regime=position.regime,
-                exit_reason=reason
+                entry_price=entry_price,
+                entry_time=datetime.now(),  # Will preserve original if exists
+                peak_price=peak_price,
+                current_price=current_price
             )
-            self.metrics.record_trade(trade)
-            
-            # Remove from positions
-            del self.positions[symbol]
-        
-        return success
-    
-    # -------------------------------------------------------------------------
-    # Main Run Loop
-    # -------------------------------------------------------------------------
-    
-    def run_once(self):
-        """Execute one iteration of the trading logic."""
-        logging.info("=" * 60)
-        logging.info("Starting trading iteration")
-        
-        # Get account info
-        account = self.trading_client.get_account()
-        account_value = float(account.portfolio_value)
-        buying_power = float(account.buying_power)
-        
-        # Update equity tracking
-        self.metrics.update_equity(account_value)
-        
-        logging.info(f"Account value: ${account_value:,.2f} | Buying power: ${buying_power:,.2f}")
-        logging.info(f"Current drawdown: {self.metrics.current_drawdown:.2%} | Max: {self.metrics.max_drawdown:.2%}")
-        
-        # Check max drawdown limit
-        if self.metrics.current_drawdown >= self.config.max_drawdown_pct:
-            logging.warning("MAX DRAWDOWN REACHED - Closing all positions")
-            self._close_all_positions("max_drawdown")
-            return
-        
-        # Fetch all data
-        all_data = self.fetch_all_data()
-        logging.info(f"Fetched data for {len(all_data)} symbols")
-        
-        # Update correlation matrix
-        self.correlation_manager.update_correlations(all_data)
-        
-        # Get current prices
-        current_prices = {
-            symbol: df.iloc[-1]['close'] 
-            for symbol, df in all_data.items() 
-            if len(df) > 0
-        }
-        
-        # Sync positions with broker
-        self._sync_positions(current_prices)
-        
-        # Check trailing stops
-        symbols_to_close = self.update_trailing_stops(current_prices)
-        for symbol in symbols_to_close:
-            if symbol in current_prices:
-                self.close_position(symbol, "trailing_stop", current_prices[symbol])
-        
-        # Calculate current exposure
-        current_positions = list(self.positions.keys())
-        num_positions = len(current_positions)
-        
-        # Process each symbol
-        for symbol, df in all_data.items():
-            # Skip if we already have a position
-            if symbol in self.positions:
-                continue
-            
-            # Skip if at position limit
-            if num_positions >= self.config.max_positions:
-                logging.debug(f"Position limit reached ({num_positions}/{self.config.max_positions})")
-                break
-            
-            # Calculate indicators
-            df = self.calculate_indicators(df)
-            
-            # Generate signal
-            signal = self.generate_signal(symbol, df)
-            
-            if signal == 'buy':
-                # Check correlation filter
-                can_open, reason = self.correlation_manager.can_open_position(
-                    symbol, current_positions
-                )
-                if not can_open:
-                    logging.info(f"{symbol}: Skipping due to correlation filter - {reason}")
-                    continue
-                
-                # Calculate position size
-                position_value = self.calculate_position_size(symbol, df, account_value)
-                
-                # Check portfolio exposure limit
-                current_exposure = sum(
-                    p.quantity * current_prices.get(p.symbol, p.entry_price)
-                    for p in self.positions.values()
-                )
-                if (current_exposure + position_value) / account_value > self.config.max_portfolio_exposure:
-                    logging.info(f"{symbol}: Skipping - would exceed max portfolio exposure")
-                    continue
-                
-                # Calculate quantity
-                current_price = current_prices[symbol]
-                quantity = position_value / current_price
-                
-                # Round appropriately
-                if symbol not in self.config.crypto_symbols:
-                    quantity = int(quantity)
-                    if quantity < 1:
-                        continue
-                
-                # Execute trade
-                regime = self.regime_state.get(symbol, 'ranging')
-                if self.execute_buy(symbol, quantity, regime):
-                    # Track position
-                    initial_stop = current_price * (1 - self.config.max_drawdown_pct)
-                    self.positions[symbol] = PositionTracker(
-                        symbol=symbol,
-                        entry_price=current_price,
-                        entry_time=datetime.now().isoformat(),
-                        quantity=quantity,
-                        side='long',
-                        peak_price=current_price,
-                        trough_price=current_price,
-                        initial_stop=initial_stop,
-                        regime=regime
-                    )
-                    num_positions += 1
-                    current_positions.append(symbol)
-        
-        # Log summary
-        logging.info(f"Iteration complete | Positions: {num_positions} | " 
-                    f"Symbols: {list(self.positions.keys())}")
-    
-    def _sync_positions(self, current_prices: Dict[str, float]):
-        """Sync internal position tracking with broker positions."""
+
+        # Calculate trailing stop level
+        stop_level = peak_price * (1 - trailing_stop_pct)
+
+        if current_price <= stop_level:
+            drawdown_from_peak = (peak_price - current_price) / peak_price
+            logger.info(f"{symbol}: Trailing stop hit! Peak=${peak_price:.2f}, "
+                       f"Current=${current_price:.2f}, Stop=${stop_level:.2f} "
+                       f"(Down {drawdown_from_peak:.1%} from peak)")
+            return True
+
+        return False
+
+    def execute_trade(self, symbol: str, side: str, qty: float,
+                      order_type: str = 'market', limit_price: float = None) -> bool:
+        """Execute a trade with proper quantity handling (fractional shares)."""
         try:
-            broker_positions = self.trading_client.get_all_positions()
-            broker_symbols = set()
-            
-            for pos in broker_positions:
-                symbol = pos.symbol
-                # Handle crypto symbols
-                if symbol == "BTCUSD":
-                    symbol = "BTC/USD"
-                
-                broker_symbols.add(symbol)
-                
-                # Update our tracking if we don't have it
-                if symbol not in self.positions:
-                    self.positions[symbol] = PositionTracker(
-                        symbol=symbol,
-                        entry_price=float(pos.avg_entry_price),
-                        entry_time=datetime.now().isoformat(),
-                        quantity=float(pos.qty),
-                        side='long' if float(pos.qty) > 0 else 'short',
-                        peak_price=float(pos.current_price),
-                        trough_price=float(pos.current_price),
-                        initial_stop=float(pos.avg_entry_price) * (1 - self.config.max_drawdown_pct),
-                        regime=self.regime_state.get(symbol, 'unknown')
-                    )
-            
-            # Remove positions we're tracking but broker doesn't have
-            closed = [s for s in self.positions if s not in broker_symbols]
-            for symbol in closed:
-                logging.info(f"Position {symbol} closed externally")
-                del self.positions[symbol]
-                
+            # Fractional shares: keep as float, don't round to int
+            # Alpaca supports fractional shares for most equities
+
+            is_crypto = '/' in symbol
+
+            if is_crypto:
+                # Crypto: use notional or qty with appropriate precision
+                qty = round(qty, 8)  # 8 decimal places for crypto
+            else:
+                # Equities: round to 4 decimal places for fractional shares
+                qty = round(qty, 4)
+
+            if qty <= 0:
+                logger.warning(f"Invalid quantity {qty} for {symbol}")
+                return False
+
+            if order_type == 'limit' and limit_price:
+                order_request = LimitOrderRequest(
+                    symbol=symbol.replace('/', ''),  # Remove slash for crypto
+                    qty=qty,
+                    side=OrderSide.BUY if side == 'BUY' else OrderSide.SELL,
+                    time_in_force=TimeInForce.GTC if is_crypto else TimeInForce.DAY,
+                    limit_price=round(limit_price, 2)
+                )
+                order_type_str = f"LIMIT @ ${limit_price:.2f}"
+            else:
+                order_request = MarketOrderRequest(
+                    symbol=symbol.replace('/', ''),
+                    qty=qty,
+                    side=OrderSide.BUY if side == 'BUY' else OrderSide.SELL,
+                    time_in_force=TimeInForce.GTC if is_crypto else TimeInForce.DAY
+                )
+                order_type_str = "MARKET"
+
+            order = self.trading_client.submit_order(order_request)
+            logger.info(f"Executed {side} {order_type_str} order: {qty} {symbol} (Order ID: {order.id})")
+
+            return True
+
         except Exception as e:
-            logging.error(f"Error syncing positions: {e}")
-    
-    def _close_all_positions(self, reason: str):
-        """Close all positions."""
-        for symbol in list(self.positions.keys()):
-            try:
-                self.trading_client.close_position(symbol.replace("/", ""))
-                logging.info(f"Closed position: {symbol} ({reason})")
-            except Exception as e:
-                logging.error(f"Error closing {symbol}: {e}")
-        
-        self.positions.clear()
-    
-    def print_metrics_summary(self):
-        """Print performance metrics summary."""
-        summary = self.metrics.get_summary()
-        
-        logging.info("=" * 60)
-        logging.info("PERFORMANCE SUMMARY")
-        logging.info("=" * 60)
-        
-        if 'message' in summary:
-            logging.info(summary['message'])
+            logger.error(f"Failed to execute {side} order for {symbol}: {e}")
+            return False
+
+    def close_position(self, symbol: str) -> bool:
+        """Close an entire position."""
+        try:
+            clean_symbol = symbol.replace('/', '')
+            self.trading_client.close_position(clean_symbol)
+            self.position_state.remove_position(symbol)
+            logger.info(f"Closed position: {symbol}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to close position {symbol}: {e}")
+            return False
+
+    def should_skip_trading(self) -> bool:
+        """Check if we should skip trading (market hours, first/last 30 mins)."""
+        now = datetime.now()
+        cfg = self.config['execution']
+        sched = self.config['scheduler']
+
+        # Always allow crypto
+        # For equities, check market hours
+        market_open = now.replace(
+            hour=sched['market_open_hour'],
+            minute=sched['market_open_minute'],
+            second=0
+        )
+        market_close = now.replace(
+            hour=sched['market_close_hour'],
+            minute=sched['market_close_minute'],
+            second=0
+        )
+
+        # Skip first and last 30 minutes
+        skip_open = market_open + timedelta(minutes=cfg['skip_first_minutes'])
+        skip_close = market_close - timedelta(minutes=cfg['skip_last_minutes'])
+
+        if now < skip_open or now > skip_close:
+            return True
+
+        return False
+
+    def run_cycle(self):
+        """Run one complete trading cycle."""
+        logger.info("=" * 60)
+        logger.info("STARTING TRADING CYCLE")
+        logger.info("=" * 60)
+
+        # Get account info
+        account = self.get_account()
+        portfolio_value = account['portfolio_value']
+        logger.info(f"Portfolio Value: ${portfolio_value:,.2f}")
+
+        # Get current positions
+        positions = self.get_positions()
+        current_position_count = len(positions)
+        logger.info(f"Current Positions: {current_position_count}")
+
+        # Calculate current exposure
+        total_exposure = sum(p['market_value'] for p in positions.values())
+        exposure_pct = total_exposure / portfolio_value if portfolio_value > 0 else 0
+        logger.info(f"Current Exposure: {exposure_pct:.1%}")
+
+        cfg = self.config['risk_management']
+
+        # ========== CHECK EXISTING POSITIONS FOR EXITS ==========
+        for symbol, position in positions.items():
+            # Normalize symbol for matching
+            lookup_symbol = symbol if '/' not in symbol else f"{symbol[:3]}/{symbol[3:]}"
+
+            current_price = position['current_price']
+
+            # Update position state (for trailing stop tracking)
+            pos_state = self.position_state.get_position(lookup_symbol)
+            if pos_state:
+                self.position_state.update_position(
+                    symbol=lookup_symbol,
+                    entry_price=position['avg_entry_price'],
+                    entry_time=pos_state.get('entry_time', datetime.now()),
+                    peak_price=pos_state.get('peak_price', current_price),
+                    current_price=current_price
+                )
+            else:
+                # New position not in state - initialize
+                self.position_state.update_position(
+                    symbol=lookup_symbol,
+                    entry_price=position['avg_entry_price'],
+                    entry_time=datetime.now(),
+                    peak_price=current_price,
+                    current_price=current_price
+                )
+
+            # Check trailing stop (12%)
+            if self.check_trailing_stop(lookup_symbol, current_price, position):
+                logger.info(f"TRAILING STOP triggered for {symbol}")
+                self.close_position(symbol)
+                continue
+
+            # Get data for signal check
+            df = self.get_bars(lookup_symbol)
+            if df is not None and len(df) > 0:
+                df = self.calculate_indicators(df)
+                signal = self.generate_signal(df, lookup_symbol)
+
+                if signal['signal'] == 'SELL':
+                    logger.info(f"SELL signal for {symbol}: {signal['reason']}")
+                    self.close_position(symbol)
+
+        # ========== CHECK FOR NEW ENTRIES ==========
+        # Refresh positions after exits
+        positions = self.get_positions()
+        current_position_count = len(positions)
+
+        # Check if we can add more positions
+        max_positions = cfg['max_positions']
+        max_exposure = cfg['max_portfolio_exposure']
+
+        total_exposure = sum(p['market_value'] for p in positions.values())
+        exposure_pct = total_exposure / portfolio_value if portfolio_value > 0 else 0
+
+        if current_position_count >= max_positions:
+            logger.info(f"Max positions reached ({max_positions}), skipping new entries")
             return
-        
-        logging.info(f"Total Trades: {summary['total_trades']}")
-        logging.info(f"Win Rate: {summary['win_rate']:.2%}")
-        logging.info(f"Total PnL: ${summary['total_pnl']:,.2f}")
-        logging.info(f"Average R-Multiple: {summary['average_r_multiple']:.2f}")
-        logging.info(f"Sharpe Ratio: {summary['sharpe_ratio']:.2f}")
-        logging.info(f"Max Drawdown: {summary['max_drawdown']:.2%}")
-        
-        logging.info("\nPerformance by Regime:")
-        for regime, stats in summary['by_regime'].items():
-            if stats['trades'] > 0:
-                wr = stats['wins'] / stats['trades']
-                logging.info(f"  {regime}: {stats['trades']} trades, {wr:.2%} win rate, ${stats['total_pnl']:.2f} PnL")
-        
-        logging.info("\nTop/Bottom Symbols by PnL:")
-        symbol_pnl = [(s, stats['total_pnl']) for s, stats in summary['by_symbol'].items() if stats['trades'] > 0]
-        symbol_pnl.sort(key=lambda x: x[1], reverse=True)
-        
-        for symbol, pnl in symbol_pnl[:3]:
-            logging.info(f"  +{symbol}: ${pnl:.2f}")
-        for symbol, pnl in symbol_pnl[-3:]:
-            if pnl < 0:
-                logging.info(f"  -{symbol}: ${pnl:.2f}")
 
+        if exposure_pct >= max_exposure:
+            logger.info(f"Max exposure reached ({exposure_pct:.1%} >= {max_exposure:.0%}), skipping new entries")
+            return
 
-# =============================================================================
-# MAIN ENTRY POINT
-# =============================================================================
+        # Skip equity trading during restricted hours
+        skip_equities = self.should_skip_trading()
+
+        # Get symbols with pending orders to avoid duplicates
+        pending_symbols = self.get_pending_orders()
+
+        # Scan watchlist for entry opportunities
+        for symbol in self.watchlist:
+            # Skip if already in position OR has pending order
+            clean_symbol = symbol.replace('/', '')
+            if clean_symbol in positions or symbol in positions:
+                continue
+            if clean_symbol in pending_symbols or symbol in pending_symbols:
+                logger.debug(f"Skipping {symbol}: pending order exists")
+                continue
+
+            # Skip equities during restricted hours
+            is_crypto = '/' in symbol
+            if not is_crypto and skip_equities:
+                continue
+
+            # Re-check limits
+            if current_position_count >= max_positions:
+                break
+            if exposure_pct >= max_exposure:
+                break
+
+            # Get data
+            df = self.get_bars(symbol)
+            if df is None or len(df) < 50:
+                continue
+
+            df = self.calculate_indicators(df)
+            signal = self.generate_signal(df, symbol)
+
+            if signal['signal'] == 'BUY':
+                # Calculate position size
+                position_value = self.calculate_position_size(symbol, df, portfolio_value)
+
+                # Check if this would exceed max exposure
+                new_exposure = (total_exposure + position_value) / portfolio_value
+                if new_exposure > max_exposure:
+                    position_value = (max_exposure * portfolio_value) - total_exposure
+                    if position_value <= 0:
+                        continue
+
+                # Calculate quantity (fractional shares supported)
+                current_price = df.iloc[-2]['close']  # Use closed candle price
+                qty = position_value / current_price
+
+                if qty > 0:
+                    logger.info(f"BUY signal for {symbol}: {signal['reason']}")
+
+                    success = self.execute_trade(
+                        symbol=symbol,
+                        side='BUY',
+                        qty=qty,
+                        order_type=signal['order_type'],
+                        limit_price=signal['limit_price']
+                    )
+
+                    if success:
+                        # Initialize position state
+                        self.position_state.update_position(
+                            symbol=symbol,
+                            entry_price=current_price,
+                            entry_time=datetime.now(),
+                            peak_price=current_price,
+                            current_price=current_price
+                        )
+
+                        current_position_count += 1
+                        total_exposure += position_value
+                        exposure_pct = total_exposure / portfolio_value
+
+        # Log final state
+        logger.info("-" * 60)
+        logger.info(f"Cycle complete. Positions: {current_position_count}, Exposure: {exposure_pct:.1%}")
+        logger.info("=" * 60)
+
 
 def main():
     """Main entry point."""
-    # Load config from environment or use defaults
-    config = TradingConfig(
-        api_key=os.environ.get('ALPACA_API_KEY', ''),
-        api_secret=os.environ.get('ALPACA_SECRET_KEY', ''),
-        paper=True
-    )
-    
-    if not config.api_key or not config.api_secret:
-        print("Please set ALPACA_API_KEY and ALPACA_SECRET_KEY environment variables")
-        print("\nExample:")
-        print("  export ALPACA_API_KEY='your-api-key'")
-        print("  export ALPACA_SECRET_KEY='your-secret-key'")
-        return
-    
-    # Create and run bot
-    bot = EnhancedTradingBot(config)
-    
-    print("\nEnhanced Trading Bot")
-    print("=" * 40)
-    print("Features enabled:")
-    print(f"  - Trailing stops: {config.trailing_stop_enabled} ({config.trailing_stop_pct:.0%} from peak)")
-    print(f"  - ATR position sizing: Target {config.atr_target_risk:.1%} risk")
-    print(f"  - Correlation filter: {config.correlation_enabled} (threshold: {config.correlation_threshold})")
-    print(f"  - ADX hysteresis: Entry>{config.adx_trending_entry}, Exit<{config.adx_trending_exit}")
-    print(f"  - Volume confirmation: {config.volume_confirmation_enabled} ({config.volume_multiplier}x avg)")
-    print(f"  - Time-of-day filter: {config.time_filter_enabled}")
-    print("=" * 40)
-    
-    # Run one iteration
-    bot.run_once()
-    
-    # Print metrics
-    bot.print_metrics_summary()
+    bot = EnhancedTradingBot()
+    bot.run_cycle()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

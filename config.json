@@ -1,90 +1,71 @@
 {
-    "api_settings": {
-        "paper": true,
-        "_comment": "Set ALPACA_API_KEY and ALPACA_SECRET_KEY as environment variables"
-    },
-    
-    "instruments": {
-        "crypto_symbols": ["BTC/USD"],
-        "etf_symbols": ["SPY", "QQQ", "IWM"],
-        "stock_symbols": [
-            "NVDA", "META", "AMZN", "GOOGL", "MSFT",
-            "AAPL", "TSLA", "AMD", "NFLX", "AVGO", "MSTR"
-        ]
-    },
-    
-    "position_sizing": {
-        "base_position_pct": 0.10,
-        "max_positions": 8,
-        "max_portfolio_exposure": 0.80,
-        "atr_period": 14,
-        "atr_target_risk": 0.02,
-        "min_position_pct": 0.03,
-        "max_position_pct": 0.15,
-        "_comment": "ATR-based sizing: higher volatility = smaller positions"
-    },
-    
-    "risk_management": {
-        "max_drawdown_pct": 0.10,
-        "take_profit_pct": 0.20
-    },
-    
-    "trailing_stop": {
-        "enabled": true,
-        "trailing_stop_pct": 0.12,
-        "activation_pct": 0.05,
-        "_comment": "Trailing stop activates after 5% profit, trails 12% from peak"
-    },
-    
-    "technical_indicators": {
-        "ema_fast": 9,
-        "ema_slow": 21,
-        "rsi_period": 14,
-        "rsi_oversold": 30,
-        "rsi_overbought": 70,
-        "bb_period": 20,
-        "bb_std": 2.0,
-        "macd_fast": 12,
-        "macd_slow": 26,
-        "macd_signal": 9
-    },
-    
-    "adx_hysteresis": {
-        "adx_period": 14,
-        "trending_entry_threshold": 25,
-        "trending_exit_threshold": 20,
-        "_comment": "ADX must exceed 25 to enter trending mode, fall below 20 to exit"
-    },
-    
-    "volume_confirmation": {
-        "enabled": true,
-        "period": 20,
-        "multiplier": 1.2,
-        "_comment": "Requires volume >= 1.2x 20-period average to confirm signals"
-    },
-    
-    "correlation_filter": {
-        "enabled": true,
-        "lookback_days": 30,
-        "threshold": 0.7,
-        "max_correlated_positions": 3,
-        "_comment": "Limits highly correlated positions to reduce drawdown risk"
-    },
-    
-    "time_of_day_filter": {
-        "enabled": true,
-        "market_open_buffer_minutes": 30,
-        "market_close_buffer_minutes": 30,
-        "_comment": "Avoids trading in volatile open/close periods for equities"
-    },
-    
-    "logging": {
-        "log_file": "trading_bot.log",
-        "metrics_file": "trading_metrics.json"
-    },
-    
-    "scheduler": {
-        "run_interval_minutes": 60,
-        "_comment": "How often to run the strategy (for runner.py)"
-    }
+  "watchlist": {
+    "mag7": ["NVDA", "MSFT", "GOOGL", "AMZN", "META", "AAPL", "TSLA", "NFLX"],
+    "semis": ["AMD", "AVGO", "MU", "INTC", "QCOM", "TSM", "SMH", "ARM"],
+    "growth_software": ["PLTR", "CRM", "NOW", "UBER", "ABNB", "PANW", "CRWD", "SNOW"],
+    "crypto_proxies": ["MSTR", "COIN", "HOOD", "MARA", "CLSK", "RIOT"],
+    "crypto": ["BTC/USD", "SOL/USD", "ETH/USD", "XRP/USD"],
+    "financials": ["JPM", "V", "MA", "BLK", "GS", "BAC"],
+    "energy_industrial": ["XLE", "CVX", "XOM", "CAT", "GE", "DE"],
+    "pharma": ["LLY", "UNH", "JNJ", "PFE", "ABBV"],
+    "commodities_bonds": ["GLD", "SLV", "TLT", "URA", "DBA", "UNG"],
+    "etfs": ["SPY", "QQQ", "IWM"]
+  },
+
+  "strategy": {
+    "ema_short": 9,
+    "ema_long": 21,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    "adx_period": 14,
+    "adx_trending_threshold": 25,
+    "adx_ranging_threshold": 20,
+    "rsi_period": 14,
+    "rsi_oversold": 30,
+    "rsi_overbought": 70,
+    "bollinger_period": 20,
+    "bollinger_std": 2.0,
+    "atr_period": 14,
+    "volume_ma_period": 20,
+    "volume_confirmation_multiplier": 1.2
+  },
+
+  "risk_management": {
+    "max_drawdown_pct": 0.15,
+    "trailing_stop_pct": 0.12,
+    "max_positions": 25,
+    "max_portfolio_exposure": 0.90,
+    "base_position_pct": 0.04,
+    "max_position_pct": 0.10,
+    "atr_risk_multiplier": 2.0,
+    "max_correlated_positions": 5,
+    "correlation_threshold": 0.7
+  },
+
+  "execution": {
+    "data_feed": "iex",
+    "timeframe": "15Min",
+    "lookback_bars": 100,
+    "skip_first_minutes": 30,
+    "skip_last_minutes": 30,
+    "use_limit_orders_for_mean_reversion": true
+  },
+
+  "scheduler": {
+    "interval_minutes": 15,
+    "market_open_hour": 9,
+    "market_open_minute": 30,
+    "market_close_hour": 16,
+    "market_close_minute": 0,
+    "crypto_24h": true
+  },
+
+  "persistence": {
+    "positions_file": "positions.json",
+    "metrics_file": "trading_metrics.json",
+    "log_file": "trading_bot.log"
+  },
+
+  "paper_trading": true
 }
