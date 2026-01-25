@@ -1,0 +1,21 @@
+alpaca-py>=0.10.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+[Unit]
+Description=Enhanced Trading Bot
+After=network.target
+
+[Service]
+Type=simple
+User=trader
+WorkingDirectory=/home/trader/trading-bot
+Environment=ALPACA_API_KEY=PK5SACYYKFKV5GZRJH2KSTPAOM
+Environment=ALPACA_SECRET_KEY=Qg4SagJg4774U34zp3BCKSM5kYQPADaxgJSBViScACj
+ExecStart=/home/trader/trading-bot/venv/bin/python runner.py
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF

@@ -1,0 +1,90 @@
+{
+    "api_settings": {
+        "paper": true,
+        "_comment": "Set ALPACA_API_KEY and ALPACA_SECRET_KEY as environment variables"
+    },
+    
+    "instruments": {
+        "crypto_symbols": ["BTC/USD"],
+        "etf_symbols": ["SPY", "QQQ", "IWM"],
+        "stock_symbols": [
+            "NVDA", "META", "AMZN", "GOOGL", "MSFT",
+            "AAPL", "TSLA", "AMD", "NFLX", "AVGO", "MSTR"
+        ]
+    },
+    
+    "position_sizing": {
+        "base_position_pct": 0.10,
+        "max_positions": 8,
+        "max_portfolio_exposure": 0.80,
+        "atr_period": 14,
+        "atr_target_risk": 0.02,
+        "min_position_pct": 0.03,
+        "max_position_pct": 0.15,
+        "_comment": "ATR-based sizing: higher volatility = smaller positions"
+    },
+    
+    "risk_management": {
+        "max_drawdown_pct": 0.10,
+        "take_profit_pct": 0.20
+    },
+    
+    "trailing_stop": {
+        "enabled": true,
+        "trailing_stop_pct": 0.12,
+        "activation_pct": 0.05,
+        "_comment": "Trailing stop activates after 5% profit, trails 12% from peak"
+    },
+    
+    "technical_indicators": {
+        "ema_fast": 9,
+        "ema_slow": 21,
+        "rsi_period": 14,
+        "rsi_oversold": 30,
+        "rsi_overbought": 70,
+        "bb_period": 20,
+        "bb_std": 2.0,
+        "macd_fast": 12,
+        "macd_slow": 26,
+        "macd_signal": 9
+    },
+    
+    "adx_hysteresis": {
+        "adx_period": 14,
+        "trending_entry_threshold": 25,
+        "trending_exit_threshold": 20,
+        "_comment": "ADX must exceed 25 to enter trending mode, fall below 20 to exit"
+    },
+    
+    "volume_confirmation": {
+        "enabled": true,
+        "period": 20,
+        "multiplier": 1.2,
+        "_comment": "Requires volume >= 1.2x 20-period average to confirm signals"
+    },
+    
+    "correlation_filter": {
+        "enabled": true,
+        "lookback_days": 30,
+        "threshold": 0.7,
+        "max_correlated_positions": 3,
+        "_comment": "Limits highly correlated positions to reduce drawdown risk"
+    },
+    
+    "time_of_day_filter": {
+        "enabled": true,
+        "market_open_buffer_minutes": 30,
+        "market_close_buffer_minutes": 30,
+        "_comment": "Avoids trading in volatile open/close periods for equities"
+    },
+    
+    "logging": {
+        "log_file": "trading_bot.log",
+        "metrics_file": "trading_metrics.json"
+    },
+    
+    "scheduler": {
+        "run_interval_minutes": 60,
+        "_comment": "How often to run the strategy (for runner.py)"
+    }
+}
