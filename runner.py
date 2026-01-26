@@ -1,325 +1,373 @@
 #!/usr/bin/env python3
 """
-Continuous Runner for Enhanced Trading Bot
-==========================================
-Runs the trading bot on a schedule with proper error handling.
+Trading Bot Runner v2.1 - FIXED
+===============================
+Fixes:
+- Added file lock to prevent multiple concurrent cycles
+- Tracks last run time to prevent duplicate runs in same interval
 
-Usage:
-    python runner.py                    # Run continuously (hourly)
-    python runner.py --once             # Run once and exit
-    python runner.py --interval 30      # Run every 30 minutes
-    python runner.py --metrics          # Just print metrics summary
+Handles:
+- 15-minute execution intervals
+- Graceful shutdown
+- State persistence loading on startup
+- Metrics tracking
 """
 
 import os
 import sys
 import json
-import time
 import signal
 import argparse
 import logging
+import fcntl
 from datetime import datetime, timedelta
+from time import sleep
 from typing import Optional
 
-from enhanced_trading_bot import EnhancedTradingBot, TradingConfig
+from enhanced_trading_bot import EnhancedTradingBot, PositionState
 
-
-# Global flag for graceful shutdown
-shutdown_requested = False
-
-
-def signal_handler(signum, frame):
-    """Handle shutdown signals."""
-    global shutdown_requested
-    print("\nShutdown requested, finishing current iteration...")
-    shutdown_requested = True
-
-
-def load_config_from_file(config_path: str = "config.json") -> TradingConfig:
-    """Load configuration from JSON file."""
-    config = TradingConfig(
-        api_key=os.environ.get('ALPACA_API_KEY', ''),
-        api_secret=os.environ.get('ALPACA_SECRET_KEY', '')
-    )
-    
-    if not os.path.exists(config_path):
-        logging.warning(f"Config file {config_path} not found, using defaults")
-        return config
-    
-    try:
-        with open(config_path, 'r') as f:
-            data = json.load(f)
-        
-        # API settings
-        if 'api_settings' in data:
-            config.paper = data['api_settings'].get('paper', True)
-        
-        # Instruments
-        if 'instruments' in data:
-            inst = data['instruments']
-            config.crypto_symbols = inst.get('crypto_symbols', config.crypto_symbols)
-            config.etf_symbols = inst.get('etf_symbols', config.etf_symbols)
-            config.stock_symbols = inst.get('stock_symbols', config.stock_symbols)
-        
-        # Position sizing
-        if 'position_sizing' in data:
-            ps = data['position_sizing']
-            config.base_position_pct = ps.get('base_position_pct', config.base_position_pct)
-            config.max_positions = ps.get('max_positions', config.max_positions)
-            config.max_portfolio_exposure = ps.get('max_portfolio_exposure', config.max_portfolio_exposure)
-            config.atr_period = ps.get('atr_period', config.atr_period)
-            config.atr_target_risk = ps.get('atr_target_risk', config.atr_target_risk)
-            config.min_position_pct = ps.get('min_position_pct', config.min_position_pct)
-            config.max_position_pct = ps.get('max_position_pct', config.max_position_pct)
-        
-        # Risk management
-        if 'risk_management' in data:
-            rm = data['risk_management']
-            config.max_drawdown_pct = rm.get('max_drawdown_pct', config.max_drawdown_pct)
-            config.take_profit_pct = rm.get('take_profit_pct', config.take_profit_pct)
-        
-        # Trailing stop
-        if 'trailing_stop' in data:
-            ts = data['trailing_stop']
-            config.trailing_stop_enabled = ts.get('enabled', config.trailing_stop_enabled)
-            config.trailing_stop_pct = ts.get('trailing_stop_pct', config.trailing_stop_pct)
-            config.trailing_stop_activation_pct = ts.get('activation_pct', config.trailing_stop_activation_pct)
-        
-        # Technical indicators
-        if 'technical_indicators' in data:
-            ti = data['technical_indicators']
-            config.ema_fast = ti.get('ema_fast', config.ema_fast)
-            config.ema_slow = ti.get('ema_slow', config.ema_slow)
-            config.rsi_period = ti.get('rsi_period', config.rsi_period)
-            config.rsi_oversold = ti.get('rsi_oversold', config.rsi_oversold)
-            config.rsi_overbought = ti.get('rsi_overbought', config.rsi_overbought)
-            config.bb_period = ti.get('bb_period', config.bb_period)
-            config.bb_std = ti.get('bb_std', config.bb_std)
-            config.macd_fast = ti.get('macd_fast', config.macd_fast)
-            config.macd_slow = ti.get('macd_slow', config.macd_slow)
-            config.macd_signal = ti.get('macd_signal', config.macd_signal)
-        
-        # ADX hysteresis
-        if 'adx_hysteresis' in data:
-            adx = data['adx_hysteresis']
-            config.adx_period = adx.get('adx_period', config.adx_period)
-            config.adx_trending_entry = adx.get('trending_entry_threshold', config.adx_trending_entry)
-            config.adx_trending_exit = adx.get('trending_exit_threshold', config.adx_trending_exit)
-        
-        # Volume confirmation
-        if 'volume_confirmation' in data:
-            vc = data['volume_confirmation']
-            config.volume_confirmation_enabled = vc.get('enabled', config.volume_confirmation_enabled)
-            config.volume_period = vc.get('period', config.volume_period)
-            config.volume_multiplier = vc.get('multiplier', config.volume_multiplier)
-        
-        # Correlation filter
-        if 'correlation_filter' in data:
-            cf = data['correlation_filter']
-            config.correlation_enabled = cf.get('enabled', config.correlation_enabled)
-            config.correlation_lookback = cf.get('lookback_days', config.correlation_lookback)
-            config.correlation_threshold = cf.get('threshold', config.correlation_threshold)
-            config.max_correlated_positions = cf.get('max_correlated_positions', config.max_correlated_positions)
-        
-        # Time of day filter
-        if 'time_of_day_filter' in data:
-            tf = data['time_of_day_filter']
-            config.time_filter_enabled = tf.get('enabled', config.time_filter_enabled)
-            config.market_open_buffer_minutes = tf.get('market_open_buffer_minutes', config.market_open_buffer_minutes)
-            config.market_close_buffer_minutes = tf.get('market_close_buffer_minutes', config.market_close_buffer_minutes)
-        
-        # Logging
-        if 'logging' in data:
-            lg = data['logging']
-            config.log_file = lg.get('log_file', config.log_file)
-            config.metrics_file = lg.get('metrics_file', config.metrics_file)
-        
-        logging.info(f"Loaded configuration from {config_path}")
-        
-    except Exception as e:
-        logging.error(f"Error loading config: {e}")
-    
-    return config
-
-
-def get_next_run_time(interval_minutes: int) -> datetime:
-    """Calculate the next aligned run time."""
-    now = datetime.now()
-    
-    # Align to interval boundaries (e.g., run at :00, :30 for 30-min interval)
-    minutes_past = now.minute % interval_minutes
-    if minutes_past == 0 and now.second < 30:
-        # We're at an aligned time, run now
-        return now
-    
-    # Calculate next aligned time
-    next_minute = now.minute + (interval_minutes - minutes_past)
-    next_run = now.replace(second=0, microsecond=0)
-    
-    if next_minute >= 60:
-        next_run = next_run + timedelta(hours=1)
-        next_run = next_run.replace(minute=next_minute - 60)
-    else:
-        next_run = next_run.replace(minute=next_minute)
-    
-    return next_run
-
-
-def run_continuous(config: TradingConfig, interval_minutes: int):
-    """Run the bot continuously on a schedule."""
-    global shutdown_requested
-    
-    print(f"\n{'='*60}")
-    print("Enhanced Trading Bot - Continuous Mode")
-    print(f"{'='*60}")
-    print(f"Interval: {interval_minutes} minutes")
-    print(f"Press Ctrl+C to stop gracefully")
-    print(f"{'='*60}\n")
-    
-    bot = EnhancedTradingBot(config)
-    iteration = 0
-    
-    while not shutdown_requested:
-        iteration += 1
-        
-        try:
-            # Calculate next run time
-            next_run = get_next_run_time(interval_minutes)
-            wait_seconds = (next_run - datetime.now()).total_seconds()
-            
-            if wait_seconds > 0:
-                print(f"\nNext run at {next_run.strftime('%H:%M:%S')} (waiting {wait_seconds:.0f}s)")
-                
-                # Wait with periodic checks for shutdown
-                while wait_seconds > 0 and not shutdown_requested:
-                    sleep_time = min(10, wait_seconds)
-                    time.sleep(sleep_time)
-                    wait_seconds -= sleep_time
-            
-            if shutdown_requested:
-                break
-            
-            # Run the bot
-            print(f"\n[Iteration {iteration}] Running at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            bot.run_once()
-            
-        except KeyboardInterrupt:
-            shutdown_requested = True
-        except Exception as e:
-            logging.error(f"Error in iteration {iteration}: {e}")
-            # Continue running despite errors
-            time.sleep(60)  # Wait a bit before retrying
-    
-    print("\nShutting down...")
-    bot.print_metrics_summary()
-    print("Goodbye!")
-
-
-def run_once(config: TradingConfig):
-    """Run the bot once and exit."""
-    print("\n" + "="*60)
-    print("Enhanced Trading Bot - Single Run")
-    print("="*60 + "\n")
-    
-    bot = EnhancedTradingBot(config)
-    bot.run_once()
-    bot.print_metrics_summary()
-
-
-def print_metrics(config: TradingConfig):
-    """Print metrics summary without running the bot."""
-    from enhanced_trading_bot import MetricsTracker
-    
-    print("\n" + "="*60)
-    print("Trading Metrics Summary")
-    print("="*60 + "\n")
-    
-    metrics = MetricsTracker(config)
-    summary = metrics.get_summary()
-    
-    if 'message' in summary:
-        print(summary['message'])
-        return
-    
-    print(f"Total Trades:       {summary['total_trades']}")
-    print(f"Win Rate:           {summary['win_rate']:.2%}")
-    print(f"Total PnL:          ${summary['total_pnl']:,.2f}")
-    print(f"Average R-Multiple: {summary['average_r_multiple']:.2f}")
-    print(f"Sharpe Ratio:       {summary['sharpe_ratio']:.2f}")
-    print(f"Max Drawdown:       {summary['max_drawdown']:.2%}")
-    print(f"Current Drawdown:   {summary['current_drawdown']:.2%}")
-    
-    print("\n--- By Regime ---")
-    for regime, stats in summary['by_regime'].items():
-        if stats['trades'] > 0:
-            wr = stats['wins'] / stats['trades']
-            print(f"  {regime.capitalize():10} {stats['trades']:3} trades | {wr:6.2%} win rate | ${stats['total_pnl']:>10,.2f} PnL")
-    
-    print("\n--- By Symbol (sorted by PnL) ---")
-    symbol_data = [
-        (sym, stats['trades'], stats['wins'], stats['total_pnl'], stats['total_r'])
-        for sym, stats in summary['by_symbol'].items()
-        if stats['trades'] > 0
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('trading_bot.log'),
+        logging.StreamHandler()
     ]
-    symbol_data.sort(key=lambda x: x[3], reverse=True)
-    
-    print(f"  {'Symbol':<10} {'Trades':>6} {'Win%':>7} {'PnL':>12} {'Avg R':>7}")
-    print("  " + "-"*45)
-    for sym, trades, wins, pnl, total_r in symbol_data:
-        wr = wins / trades if trades > 0 else 0
-        avg_r = total_r / trades if trades > 0 else 0
-        print(f"  {sym:<10} {trades:>6} {wr:>6.1%} ${pnl:>10,.2f} {avg_r:>7.2f}")
+)
+logger = logging.getLogger(__name__)
+
+# Lock file to prevent concurrent runs
+LOCK_FILE = "/tmp/trading_bot.lock"
+LAST_RUN_FILE = "/tmp/trading_bot_last_run.txt"
+
+
+class TradingMetrics:
+    """Track and persist trading metrics."""
+
+    def __init__(self, filepath: str = "trading_metrics.json"):
+        self.filepath = filepath
+        self.metrics = self.load()
+
+    def load(self) -> dict:
+        """Load metrics from disk."""
+        if os.path.exists(self.filepath):
+            try:
+                with open(self.filepath, 'r') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                pass
+
+        return {
+            'start_date': datetime.now().isoformat(),
+            'total_cycles': 0,
+            'total_trades': 0,
+            'winning_trades': 0,
+            'losing_trades': 0,
+            'total_pnl': 0.0,
+            'peak_portfolio_value': 0.0,
+            'max_drawdown': 0.0,
+            'last_updated': datetime.now().isoformat()
+        }
+
+    def save(self):
+        """Save metrics to disk."""
+        self.metrics['last_updated'] = datetime.now().isoformat()
+        try:
+            with open(self.filepath, 'w') as f:
+                json.dump(self.metrics, f, indent=2)
+        except IOError as e:
+            logger.error(f"Failed to save metrics: {e}")
+
+    def record_cycle(self, portfolio_value: float):
+        """Record a completed cycle."""
+        self.metrics['total_cycles'] += 1
+
+        if portfolio_value > self.metrics['peak_portfolio_value']:
+            self.metrics['peak_portfolio_value'] = portfolio_value
+
+        if self.metrics['peak_portfolio_value'] > 0:
+            drawdown = (self.metrics['peak_portfolio_value'] - portfolio_value) / self.metrics['peak_portfolio_value']
+            if drawdown > self.metrics['max_drawdown']:
+                self.metrics['max_drawdown'] = drawdown
+
+        self.save()
+
+    def display(self):
+        """Display current metrics."""
+        m = self.metrics
+        print("\n" + "=" * 50)
+        print(" TRADING METRICS")
+        print("=" * 50)
+        print(f"  Running since:       {m['start_date'][:10]}")
+        print(f"  Total cycles:        {m['total_cycles']}")
+        print(f"  Total trades:        {m['total_trades']}")
+
+        if m['total_trades'] > 0:
+            win_rate = m['winning_trades'] / m['total_trades'] * 100
+            print(f"  Win rate:            {win_rate:.1f}%")
+
+        print(f"  Total PnL:           ${m['total_pnl']:,.2f}")
+        print(f"  Peak value:          ${m['peak_portfolio_value']:,.2f}")
+        print(f"  Max drawdown:        {m['max_drawdown']*100:.2f}%")
+        print(f"  Last updated:        {m['last_updated'][:19]}")
+        print("=" * 50 + "\n")
+
+
+class GracefulKiller:
+    """Handle graceful shutdown on SIGINT/SIGTERM."""
+
+    kill_now = False
+
+    def __init__(self):
+        signal.signal(signal.SIGINT, self.exit_gracefully)
+        signal.signal(signal.SIGTERM, self.exit_gracefully)
+
+    def exit_gracefully(self, signum, frame):
+        logger.info("Shutdown signal received, completing current cycle...")
+        self.kill_now = True
+
+
+def get_current_interval(interval_minutes: int) -> str:
+    """Get the current interval identifier (e.g., '2026-01-19T13:15')."""
+    now = datetime.now()
+    interval_start = now.replace(
+        minute=(now.minute // interval_minutes) * interval_minutes,
+        second=0,
+        microsecond=0
+    )
+    return interval_start.strftime('%Y-%m-%dT%H:%M')
+
+
+def already_ran_this_interval(interval_minutes: int) -> bool:
+    """Check if we already ran in the current interval."""
+    current_interval = get_current_interval(interval_minutes)
+
+    if os.path.exists(LAST_RUN_FILE):
+        try:
+            with open(LAST_RUN_FILE, 'r') as f:
+                last_interval = f.read().strip()
+
+            if last_interval == current_interval:
+                return True
+        except IOError:
+            pass
+
+    return False
+
+
+def mark_interval_complete(interval_minutes: int):
+    """Mark the current interval as complete."""
+    current_interval = get_current_interval(interval_minutes)
+    try:
+        with open(LAST_RUN_FILE, 'w') as f:
+            f.write(current_interval)
+    except IOError as e:
+        logger.warning(f"Could not write last run file: {e}")
+
+
+def load_and_verify_state(config_path: str = "config.json"):
+    """
+    Load and verify position state on startup.
+    Ensures trailing stop data survives restarts.
+    """
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    positions_file = config['persistence'].get('positions_file', 'positions.json')
+
+    if os.path.exists(positions_file):
+        try:
+            with open(positions_file, 'r') as f:
+                positions = json.load(f)
+
+            logger.info(f"Loaded {len(positions)} position states from {positions_file}")
+
+            for symbol, state in positions.items():
+                logger.info(f"  {symbol}: entry=${state.get('entry_price', 'N/A')}, "
+                           f"peak=${state.get('peak_price', 'N/A')}")
+
+            return positions
+        except (json.JSONDecodeError, IOError) as e:
+            logger.warning(f"Could not load positions file: {e}")
+
+    return {}
+
+
+def wait_for_next_interval(interval_minutes: int):
+    """Wait until the next interval boundary (e.g., :00, :15, :30, :45 for 15-min)."""
+    now = datetime.now()
+
+    # Calculate next interval
+    minutes_past = now.minute % interval_minutes
+    if minutes_past == 0 and now.second < 5:
+        # We're at the boundary, run now
+        return
+
+    minutes_to_wait = interval_minutes - minutes_past
+    next_run = now.replace(second=0, microsecond=0) + timedelta(minutes=minutes_to_wait)
+
+    wait_seconds = (next_run - now).total_seconds()
+
+    if wait_seconds > 0:
+        logger.info(f"Waiting {wait_seconds:.0f} seconds until next interval ({next_run.strftime('%H:%M')})")
+        sleep(wait_seconds)
+
+
+def run_once(config_path: str = "config.json"):
+    """Run a single trading cycle."""
+    logger.info("Running single cycle...")
+
+    # Verify state is loaded
+    load_and_verify_state(config_path)
+
+    bot = EnhancedTradingBot(config_path)
+    bot.run_cycle()
+
+    logger.info("Single cycle complete.")
+
+
+def run_continuous(config_path: str = "config.json", interval: Optional[int] = None):
+    """Run continuous trading loop with protection against duplicate runs."""
+
+    # Load config for interval
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    if interval is None:
+        interval = config['scheduler'].get('interval_minutes', 15)
+
+    logger.info("=" * 60)
+    logger.info(" STARTING CONTINUOUS TRADING BOT v2.1")
+    logger.info("=" * 60)
+    logger.info(f"  Interval: {interval} minutes")
+    logger.info(f"  Config: {config_path}")
+    logger.info("=" * 60)
+
+    # Load and verify existing state
+    existing_positions = load_and_verify_state(config_path)
+    if existing_positions:
+        logger.info(f"Restored {len(existing_positions)} position states from previous session")
+
+    # Initialize
+    killer = GracefulKiller()
+    metrics = TradingMetrics(config['persistence'].get('metrics_file', 'trading_metrics.json'))
+
+    # Wait for next interval boundary
+    wait_for_next_interval(interval)
+
+    while not killer.kill_now:
+        try:
+            # Check if we already ran this interval
+            if already_ran_this_interval(interval):
+                logger.debug("Already ran this interval, waiting for next...")
+                sleep(5)  # Brief sleep before checking again
+                wait_for_next_interval(interval)
+                continue
+
+            cycle_start = datetime.now()
+            logger.info(f"Starting cycle at {cycle_start.strftime('%Y-%m-%d %H:%M:%S')}")
+
+            # Initialize bot fresh each cycle (but state is persistent)
+            bot = EnhancedTradingBot(config_path)
+
+            # Run cycle
+            bot.run_cycle()
+
+            # Mark this interval as complete
+            mark_interval_complete(interval)
+
+            # Record metrics
+            account = bot.get_account()
+            metrics.record_cycle(account['portfolio_value'])
+
+            # Wait for next interval
+            if not killer.kill_now:
+                wait_for_next_interval(interval)
+
+        except KeyboardInterrupt:
+            logger.info("Keyboard interrupt received")
+            break
+        except Exception as e:
+            logger.error(f"Error in trading cycle: {e}", exc_info=True)
+            # Wait before retrying
+            if not killer.kill_now:
+                logger.info("Waiting 60 seconds before retry...")
+                sleep(60)
+
+    logger.info("Trading bot stopped gracefully.")
+    metrics.display()
+
+
+def show_metrics(config_path: str = "config.json"):
+    """Display trading metrics."""
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    metrics = TradingMetrics(config['persistence'].get('metrics_file', 'trading_metrics.json'))
+    metrics.display()
+
+
+def show_positions(config_path: str = "config.json"):
+    """Display current position states."""
+    positions = load_and_verify_state(config_path)
+
+    print("\n" + "=" * 60)
+    print(" POSITION STATES (Persistent)")
+    print("=" * 60)
+
+    if not positions:
+        print("  No positions tracked.")
+    else:
+        for symbol, state in positions.items():
+            entry = state.get('entry_price', 'N/A')
+            peak = state.get('peak_price', 'N/A')
+            entry_time = state.get('entry_time', 'N/A')
+
+            if isinstance(entry, (int, float)) and isinstance(peak, (int, float)):
+                gain_from_entry = (peak - entry) / entry * 100
+                print(f"  {symbol}:")
+                print(f"    Entry: ${entry:.2f} @ {entry_time[:16] if isinstance(entry_time, str) else 'N/A'}")
+                print(f"    Peak:  ${peak:.2f} (+{gain_from_entry:.1f}% from entry)")
+                print(f"    Stop:  ${peak * 0.88:.2f} (12% trailing)")
+            else:
+                print(f"  {symbol}: {state}")
+
+    print("=" * 60 + "\n")
 
 
 def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description="Enhanced Trading Bot Runner",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-    python runner.py                    # Run continuously (hourly)
-    python runner.py --once             # Run once and exit  
-    python runner.py --interval 30      # Run every 30 minutes
-    python runner.py --metrics          # Print metrics summary
-    python runner.py --config my.json   # Use custom config file
-        """
-    )
-    
-    parser.add_argument('--once', action='store_true', 
-                       help='Run once and exit')
-    parser.add_argument('--interval', type=int, default=60,
-                       help='Run interval in minutes (default: 60)')
-    parser.add_argument('--metrics', action='store_true',
-                       help='Print metrics summary and exit')
-    parser.add_argument('--config', type=str, default='config.json',
-                       help='Path to config file (default: config.json)')
-    
+    parser = argparse.ArgumentParser(description='Enhanced Trading Bot Runner')
+    parser.add_argument('--once', action='store_true', help='Run single cycle and exit')
+    parser.add_argument('--interval', type=int, help='Override interval in minutes')
+    parser.add_argument('--metrics', action='store_true', help='Show trading metrics')
+    parser.add_argument('--positions', action='store_true', help='Show position states')
+    parser.add_argument('--config', type=str, default='config.json', help='Config file path')
+
     args = parser.parse_args()
-    
-    # Load configuration
-    config = load_config_from_file(args.config)
-    
-    # Validate API keys
-    if not config.api_key or not config.api_secret:
-        print("Error: API keys not set!")
-        print("\nPlease set environment variables:")
-        print("  export ALPACA_API_KEY='your-api-key'")
-        print("  export ALPACA_SECRET_KEY='your-secret-key'")
+
+    # Check for API keys
+    if not os.environ.get('ALPACA_API_KEY') or not os.environ.get('ALPACA_SECRET_KEY'):
+        print("ERROR: ALPACA_API_KEY and ALPACA_SECRET_KEY must be set")
+        print("\nSet them with:")
+        print("  export ALPACA_API_KEY='your-key'")
+        print("  export ALPACA_SECRET_KEY='your-secret'")
         sys.exit(1)
-    
-    # Register signal handlers
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    # Run appropriate mode
+
+    # Check config exists
+    if not os.path.exists(args.config):
+        print(f"ERROR: Config file not found: {args.config}")
+        sys.exit(1)
+
     if args.metrics:
-        print_metrics(config)
+        show_metrics(args.config)
+    elif args.positions:
+        show_positions(args.config)
     elif args.once:
-        run_once(config)
+        run_once(args.config)
     else:
-        run_continuous(config, args.interval)
+        run_continuous(args.config, args.interval)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
