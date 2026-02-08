@@ -49,6 +49,7 @@ class PositionState:
     def __init__(self, filepath: str = "positions.json"):
         self.filepath = filepath
         self.positions: Dict[str, dict] = {}
+        self._dirty = False  # Track whether in-memory state has unsaved changes
         self.load()
 
     def load(self):
@@ -64,19 +65,26 @@ class PositionState:
         else:
             logger.info("No existing positions file found, starting fresh")
             self.positions = {}
+        self._dirty = False
 
     def save(self):
-        """Save position state to disk immediately."""
+        """Save position state to disk."""
         try:
             with open(self.filepath, 'w') as f:
                 json.dump(self.positions, f, indent=2, default=str)
+            self._dirty = False
         except IOError as e:
             logger.error(f"Failed to save positions file: {e}")
+
+    def flush(self):
+        """Save to disk only if there are unsaved changes."""
+        if self._dirty:
+            self.save()
 
     def update_position(self, symbol: str, entry_price: float, entry_time: datetime,
                         peak_price: float, current_price: float,
                         entry_atr: float = 0.0):
-        """Update or create position state and save immediately."""
+        """Update or create position state. Call flush() to persist."""
         new_peak = max(peak_price, current_price)
 
         existing = self.positions.get(symbol, {})
@@ -88,17 +96,17 @@ class PositionState:
             'entry_atr': entry_atr if entry_atr > 0 else existing.get('entry_atr', 0.0),
             'last_updated': datetime.now().isoformat()
         }
-        self.save()  # Persist immediately
+        self._dirty = True
 
     def get_position(self, symbol: str) -> Optional[dict]:
         """Get position state if exists."""
         return self.positions.get(symbol)
 
     def remove_position(self, symbol: str):
-        """Remove position state and save."""
+        """Remove position state. Saves immediately (position closed = critical)."""
         if symbol in self.positions:
             del self.positions[symbol]
-            self.save()
+            self.save()  # Immediate save: closing a position is irreversible
 
     def get_peak_price(self, symbol: str, current_price: float) -> float:
         """Get peak price for trailing stop calculation."""
@@ -188,9 +196,11 @@ class EnhancedTradingBot:
     """
 
     def __init__(self, config_path: str = "config.json"):
+        self.config_path = config_path
+        self._config_mtime: float = 0.0
+
         # Load configuration
-        with open(config_path, 'r') as f:
-            self.config = json.load(f)
+        self._load_config()
 
         # API credentials from environment
         api_key = os.environ.get('ALPACA_API_KEY')
@@ -199,7 +209,7 @@ class EnhancedTradingBot:
         if not api_key or not secret_key:
             raise ValueError("ALPACA_API_KEY and ALPACA_SECRET_KEY must be set")
 
-        # Initialize clients
+        # Initialize clients (expensive - only done once)
         self.trading_client = TradingClient(api_key, secret_key, paper=self.config.get('paper_trading', True))
         self.stock_data_client = StockHistoricalDataClient(api_key, secret_key)
         self.crypto_data_client = CryptoHistoricalDataClient(api_key, secret_key)
@@ -208,6 +218,22 @@ class EnhancedTradingBot:
         self.position_state = PositionState(
             self.config['persistence'].get('positions_file', 'positions.json')
         )
+
+        # Track trades executed this cycle for metrics
+        self.cycle_trades: List[dict] = []
+
+        # Per-cycle cache for bar data (cleared at start of each run_cycle)
+        # Keyed by (symbol, timeframe) -> DataFrame
+        self._bars_cache: Dict[Tuple[str, str], Optional[pd.DataFrame]] = {}
+
+        logger.info(f"Initialized bot with {len(self.watchlist)} symbols")
+        logger.info(f"  Crypto: {len(self.crypto_symbols)}, Equities: {len(self.equity_symbols)}")
+
+    def _load_config(self):
+        """Load config and rebuild derived state. Called on init and when config changes."""
+        with open(self.config_path, 'r') as f:
+            self.config = json.load(f)
+        self._config_mtime = os.path.getmtime(self.config_path)
 
         # Build watchlist
         self.watchlist = self._build_watchlist()
@@ -221,11 +247,16 @@ class EnhancedTradingBot:
         for s in self.crypto_symbols:
             self._crypto_symbol_map[s.replace('/', '')] = s
 
-        # Track trades executed this cycle for metrics
-        self.cycle_trades: List[dict] = []
-
-        logger.info(f"Initialized bot with {len(self.watchlist)} symbols")
-        logger.info(f"  Crypto: {len(self.crypto_symbols)}, Equities: {len(self.equity_symbols)}")
+    def reload_config_if_changed(self):
+        """Reload config.json only if the file has been modified since last load."""
+        try:
+            current_mtime = os.path.getmtime(self.config_path)
+            if current_mtime > self._config_mtime:
+                logger.info("Config file changed, reloading...")
+                self._load_config()
+                logger.info(f"Reloaded config: {len(self.watchlist)} symbols")
+        except OSError:
+            pass
 
     def _build_watchlist(self) -> List[str]:
         """Flatten watchlist from config."""
@@ -289,7 +320,12 @@ class EnhancedTradingBot:
 
 
     def get_bars(self, symbol: str, timeframe: str = "15Min", limit: int = 100) -> Optional[pd.DataFrame]:
-        """Fetch historical bars for a symbol."""
+        """Fetch historical bars for a symbol. Daily bars are cached per cycle."""
+        # Return cached daily bars if available (they only change once/day)
+        cache_key = (symbol, timeframe)
+        if timeframe == '1Day' and cache_key in self._bars_cache:
+            return self._bars_cache[cache_key]
+
         try:
             tf_map = {
                 "1Min": TimeFrame.Minute,
@@ -335,10 +371,18 @@ class EnhancedTradingBot:
 
             df = bars.df.reset_index()
             df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume', 'trade_count', 'vwap']]
+
+            # Cache daily bars for this cycle
+            if timeframe == '1Day':
+                self._bars_cache[cache_key] = df
+
             return df
 
         except Exception as e:
             logger.warning(f"Failed to fetch bars for {symbol}: {e}")
+            # Cache failures too so we don't retry the same failing symbol
+            if timeframe == '1Day':
+                self._bars_cache[cache_key] = None
             return None
 
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -873,6 +917,13 @@ class EnhancedTradingBot:
         logger.info("STARTING TRADING CYCLE")
         logger.info("=" * 60)
 
+        # Clear per-cycle state
+        self.cycle_trades = []
+        self._bars_cache = {}
+
+        # Hot-reload config if file changed (picks up watchlist/threshold changes)
+        self.reload_config_if_changed()
+
         # Get account info
         account = self.get_account()
         portfolio_value = account['portfolio_value']
@@ -1090,6 +1141,9 @@ class EnhancedTradingBot:
                         exposure_pct = total_exposure / portfolio_value
                         cash -= position_value
                         sector_counts[sector] = sector_counts.get(sector, 0) + 1
+
+        # Flush position state to disk (single write instead of per-update)
+        self.position_state.flush()
 
         # Log final state
         logger.info("-" * 60)

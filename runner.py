@@ -265,6 +265,9 @@ def run_continuous(config_path: str = "config.json", interval: Optional[int] = N
     killer = GracefulKiller()
     metrics = TradingMetrics(config['persistence'].get('metrics_file', 'trading_metrics.json'))
 
+    # Create bot once and reuse across cycles (API clients are expensive to init)
+    bot = EnhancedTradingBot(config_path)
+
     # Wait for next interval boundary
     wait_for_next_interval(interval)
 
@@ -293,10 +296,7 @@ def run_continuous(config_path: str = "config.json", interval: Optional[int] = N
                 continue
 
             try:
-                # Initialize bot fresh each cycle (but state is persistent)
-                bot = EnhancedTradingBot(config_path)
-
-                # Run cycle
+                # Reuse bot instance (config hot-reloads inside run_cycle)
                 bot.run_cycle()
 
                 # Mark this interval as complete
