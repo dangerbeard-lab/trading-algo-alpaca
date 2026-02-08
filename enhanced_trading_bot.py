@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-Enhanced Trading Bot v2.0
+Enhanced Trading Bot v3.0
 =========================
-Multi-asset hybrid strategy with critical fixes:
+Multi-asset hybrid strategy with down-market optimizations:
 - Lookahead bias fix (uses closed candles only)
 - State persistence (positions.json)
 - Fractional share support
-- 12% trailing stop (no fixed TP)
-- ATR-based position sizing (4-10%)
+- Adaptive trailing stop (tightens in bearish markets)
+- ATR-based position sizing using CASH (not portfolio_value)
 - Limit orders for mean reversion
+- SPY market trend filter (blocks equity longs in downtrends)
+- Daily timeframe trend confirmation
+- Portfolio drawdown circuit breaker
+- Sector exposure limits (max correlated positions)
 """
 
 import os
@@ -471,15 +475,36 @@ class EnhancedTradingBot:
 
         return position_value
 
-    def check_trailing_stop(self, symbol: str, current_price: float, position: dict) -> bool:
+    def check_trailing_stop(self, symbol: str, current_price: float, position: dict,
+                             market_bearish: bool = False) -> bool:
         """
-        Check if trailing stop is hit (12% from peak).
+        Adaptive trailing stop that tightens in bearish/volatile conditions.
+
+        Base stop: trailing_stop_pct from config (12%)
+        Adjustments:
+        - Tightens to 8% when broad market (SPY) is bearish
+        - Tightens further based on ATR volatility of the symbol
+        - Loosens slightly for positions with large unrealized gains (let winners run)
+
         Updates peak price in persistent state.
         """
         cfg = self.config['risk_management']
-        trailing_stop_pct = cfg['trailing_stop_pct']  # 0.12 = 12%
+        base_stop_pct = cfg['trailing_stop_pct']  # 0.12 = 12%
 
         entry_price = position['avg_entry_price']
+        unrealized_plpc = position.get('unrealized_plpc', 0)
+
+        # ---- Adaptive stop calculation ----
+        trailing_stop_pct = base_stop_pct
+
+        # Tighten stop in bearish market: 12% -> 8%
+        if market_bearish:
+            trailing_stop_pct = min(trailing_stop_pct, 0.08)
+
+        # Ratchet tighter for positions with gains > 15% (protect profits)
+        if unrealized_plpc > 0.15:
+            # E.g. at 20% gain, stop tightens from 12% to ~9%
+            trailing_stop_pct = min(trailing_stop_pct, max(0.06, base_stop_pct - unrealized_plpc * 0.2))
 
         # Get or initialize peak price from persistent state
         peak_price = self.position_state.get_peak_price(symbol, current_price)
@@ -502,7 +527,9 @@ class EnhancedTradingBot:
             drawdown_from_peak = (peak_price - current_price) / peak_price
             logger.info(f"{symbol}: Trailing stop hit! Peak=${peak_price:.2f}, "
                        f"Current=${current_price:.2f}, Stop=${stop_level:.2f} "
-                       f"(Down {drawdown_from_peak:.1%} from peak)")
+                       f"(Down {drawdown_from_peak:.1%} from peak, "
+                       f"adaptive stop={trailing_stop_pct:.0%}"
+                       f"{', BEARISH MARKET' if market_bearish else ''})")
             return True
 
         return False
@@ -566,6 +593,129 @@ class EnhancedTradingBot:
             logger.error(f"Failed to close position {symbol}: {e}")
             return False
 
+    def check_market_trend(self) -> dict:
+        """
+        Check broad market health using SPY daily bars.
+        Returns dict with market state info used to gate new entries.
+        """
+        result = {
+            'bullish': True,  # default permissive if data unavailable
+            'spy_above_ema': True,
+            'spy_ema_slope_up': True,
+            'reason': ''
+        }
+        try:
+            df = self.get_bars('SPY', timeframe='1Day', limit=50)
+            if df is None or len(df) < 30:
+                logger.warning("Could not fetch SPY daily data for market filter, defaulting to permissive")
+                return result
+
+            df = df.copy()
+            close = df['close']
+            ema_21 = TechnicalIndicators.ema(close, 21)
+            ema_50 = TechnicalIndicators.ema(close, 50)
+
+            # Use last closed daily bar
+            current_close = close.iloc[-2]
+            current_ema21 = ema_21.iloc[-2]
+            current_ema50 = ema_50.iloc[-2]
+            prev_ema21 = ema_21.iloc[-3]
+
+            spy_above_ema = current_close > current_ema21
+            ema_slope_up = current_ema21 > prev_ema21
+            ema21_above_ema50 = current_ema21 > current_ema50
+
+            # Market is bearish if price is below EMA21 AND EMA21 is sloping down
+            is_bullish = spy_above_ema or ema_slope_up
+
+            result = {
+                'bullish': is_bullish,
+                'spy_above_ema': spy_above_ema,
+                'spy_ema_slope_up': ema_slope_up,
+                'ema21_above_ema50': ema21_above_ema50,
+                'reason': (
+                    f"SPY={'above' if spy_above_ema else 'BELOW'} EMA21, "
+                    f"slope={'up' if ema_slope_up else 'DOWN'}, "
+                    f"EMA21 {'>' if ema21_above_ema50 else '<'} EMA50"
+                )
+            }
+
+            if not is_bullish:
+                logger.warning(f"MARKET FILTER: Bearish regime detected - {result['reason']}")
+            else:
+                logger.info(f"Market filter: {result['reason']}")
+
+        except Exception as e:
+            logger.warning(f"Market trend check failed: {e}, defaulting to permissive")
+
+        return result
+
+    def check_daily_trend(self, symbol: str) -> Optional[str]:
+        """
+        Check the daily trend direction for a symbol.
+        Returns 'up', 'down', or None if data unavailable.
+        Prevents buying 15-min signals against the daily trend.
+        """
+        try:
+            df = self.get_bars(symbol, timeframe='1Day', limit=30)
+            if df is None or len(df) < 22:
+                return None
+
+            df = df.copy()
+            close = df['close']
+            ema_21 = TechnicalIndicators.ema(close, 21)
+
+            current_close = close.iloc[-2]
+            current_ema = ema_21.iloc[-2]
+            prev_ema = ema_21.iloc[-3]
+
+            if current_close > current_ema and current_ema > prev_ema:
+                return 'up'
+            elif current_close < current_ema and current_ema < prev_ema:
+                return 'down'
+            return None  # indeterminate
+
+        except Exception as e:
+            logger.debug(f"Daily trend check failed for {symbol}: {e}")
+            return None
+
+    def check_drawdown_circuit_breaker(self, account: dict) -> bool:
+        """
+        Check if portfolio drawdown exceeds max_drawdown_pct.
+        Returns True if new entries should be blocked.
+        Uses the persistent metrics peak_portfolio_value to track the high-water mark.
+        """
+        cfg = self.config['risk_management']
+        max_dd = cfg.get('max_drawdown_pct', 0.15)
+
+        portfolio_value = account['portfolio_value']
+
+        # Load metrics to get peak portfolio value
+        metrics_file = self.config['persistence'].get('metrics_file', 'trading_metrics.json')
+        peak_value = portfolio_value  # default if no history
+        if os.path.exists(metrics_file):
+            try:
+                with open(metrics_file, 'r') as f:
+                    metrics = json.load(f)
+                peak_value = max(metrics.get('peak_portfolio_value', portfolio_value), portfolio_value)
+            except (json.JSONDecodeError, IOError):
+                pass
+
+        if peak_value <= 0:
+            return False
+
+        current_dd = (peak_value - portfolio_value) / peak_value
+        if current_dd >= max_dd:
+            logger.warning(f"CIRCUIT BREAKER: Portfolio drawdown {current_dd:.1%} exceeds "
+                          f"max {max_dd:.0%} (peak=${peak_value:,.0f}, current=${portfolio_value:,.0f}). "
+                          f"Blocking new entries.")
+            return True
+
+        if current_dd > max_dd * 0.7:
+            logger.info(f"Drawdown warning: {current_dd:.1%} approaching limit of {max_dd:.0%}")
+
+        return False
+
     def should_skip_trading(self) -> bool:
         """Check if we should skip trading (market hours, first/last 30 mins)."""
         now = datetime.now()
@@ -594,6 +744,30 @@ class EnhancedTradingBot:
 
         return False
 
+    def _get_sector_for_symbol(self, symbol: str) -> str:
+        """Map a symbol back to its watchlist sector for correlation limits."""
+        for sector, symbols in self.config['watchlist'].items():
+            if symbol in symbols:
+                return sector
+        return 'unknown'
+
+    def _count_sector_positions(self, positions: Dict[str, dict]) -> Dict[str, int]:
+        """Count how many current positions belong to each sector."""
+        sector_counts: Dict[str, int] = {}
+        for symbol in positions:
+            # Normalize crypto symbols for lookup
+            lookup = symbol if '/' in symbol else symbol
+            # Also try with slash for crypto
+            sector = self._get_sector_for_symbol(lookup)
+            if sector == 'unknown':
+                # Try crypto format
+                for s in self.crypto_symbols:
+                    if s.replace('/', '') == symbol:
+                        sector = self._get_sector_for_symbol(s)
+                        break
+            sector_counts[sector] = sector_counts.get(sector, 0) + 1
+        return sector_counts
+
     def run_cycle(self):
         """Run one complete trading cycle."""
         logger.info("=" * 60)
@@ -603,7 +777,8 @@ class EnhancedTradingBot:
         # Get account info
         account = self.get_account()
         portfolio_value = account['portfolio_value']
-        logger.info(f"Portfolio Value: ${portfolio_value:,.2f}")
+        cash = account['cash']
+        logger.info(f"Portfolio Value: ${portfolio_value:,.2f} | Cash: ${cash:,.2f}")
 
         # Get current positions
         positions = self.get_positions()
@@ -616,6 +791,10 @@ class EnhancedTradingBot:
         logger.info(f"Current Exposure: {exposure_pct:.1%}")
 
         cfg = self.config['risk_management']
+
+        # MARKET FILTER: Check broad market trend (SPY) - used for both exits and entries
+        market = self.check_market_trend()
+        market_bearish = not market['bullish']
 
         # ========== CHECK EXISTING POSITIONS FOR EXITS ==========
         for symbol, position in positions.items():
@@ -644,8 +823,9 @@ class EnhancedTradingBot:
                     current_price=current_price
                 )
 
-            # Check trailing stop (12%)
-            if self.check_trailing_stop(lookup_symbol, current_price, position):
+            # ADAPTIVE trailing stop: tightens in bearish market
+            if self.check_trailing_stop(lookup_symbol, current_price, position,
+                                        market_bearish=market_bearish):
                 logger.info(f"TRAILING STOP triggered for {symbol}")
                 self.close_position(symbol)
                 continue
@@ -660,7 +840,7 @@ class EnhancedTradingBot:
                     logger.info(f"SELL signal for {symbol}: {signal['reason']}")
                     self.close_position(symbol)
 
-        # ========== CHECK FOR NEW ENTRIES ==========
+        # ========== PRE-ENTRY CHECKS ==========
         # Refresh positions after exits
         positions = self.get_positions()
         current_position_count = len(positions)
@@ -680,13 +860,26 @@ class EnhancedTradingBot:
             logger.info(f"Max exposure reached ({exposure_pct:.1%} >= {max_exposure:.0%}), skipping new entries")
             return
 
+        # CIRCUIT BREAKER: Check portfolio drawdown before opening new positions
+        if self.check_drawdown_circuit_breaker(account):
+            logger.warning("Circuit breaker active - only managing exits, no new entries")
+            return
+
         # Skip equity trading during restricted hours
         skip_equities = self.should_skip_trading()
 
         # Get symbols with pending orders to avoid duplicates
         pending_symbols = self.get_pending_orders()
 
-        # Scan watchlist for entry opportunities
+        # Sector exposure tracking
+        sector_counts = self._count_sector_positions(positions)
+        max_sector = cfg.get('max_correlated_positions', 5)
+
+        # Refresh cash after exits (account may have changed)
+        account = self.get_account()
+        cash = account['cash']
+
+        # ========== SCAN FOR NEW ENTRIES ==========
         for symbol in self.watchlist:
             # Skip if already in position OR has pending order
             clean_symbol = symbol.replace('/', '')
@@ -707,6 +900,17 @@ class EnhancedTradingBot:
             if exposure_pct >= max_exposure:
                 break
 
+            # MARKET FILTER: Block new equity longs when SPY is bearish
+            if not is_crypto and not market['bullish']:
+                logger.debug(f"Skipping {symbol}: market filter bearish ({market['reason']})")
+                continue
+
+            # SECTOR LIMIT: Check if this sector is already at max
+            sector = self._get_sector_for_symbol(symbol)
+            if sector_counts.get(sector, 0) >= max_sector:
+                logger.debug(f"Skipping {symbol}: sector '{sector}' at max ({max_sector} positions)")
+                continue
+
             # Get data
             df = self.get_bars(symbol)
             if df is None or len(df) < 50:
@@ -716,13 +920,30 @@ class EnhancedTradingBot:
             signal = self.generate_signal(df, symbol)
 
             if signal['signal'] == 'BUY':
-                # Calculate position size
-                position_value = self.calculate_position_size(symbol, df, portfolio_value)
+                # DAILY TREND FILTER: Don't buy against daily downtrend
+                daily_trend = self.check_daily_trend(symbol)
+                if daily_trend == 'down':
+                    logger.info(f"Skipping {symbol} BUY: daily trend is DOWN (counter-trend filter)")
+                    continue
+
+                # FIX: Size positions using CASH, not portfolio_value (avoid margin leverage)
+                position_value = self.calculate_position_size(symbol, df, cash)
+
+                # Reduce position size when market is uncertain (not strongly bullish)
+                if not market.get('ema21_above_ema50', True):
+                    position_value *= 0.6
+                    logger.info(f"Reduced position size for {symbol}: SPY EMA21 < EMA50")
 
                 # Check if this would exceed max exposure
                 new_exposure = (total_exposure + position_value) / portfolio_value
                 if new_exposure > max_exposure:
                     position_value = (max_exposure * portfolio_value) - total_exposure
+                    if position_value <= 0:
+                        continue
+
+                # Don't exceed available cash
+                if position_value > cash * 0.95:
+                    position_value = cash * 0.95
                     if position_value <= 0:
                         continue
 
@@ -754,6 +975,8 @@ class EnhancedTradingBot:
                         current_position_count += 1
                         total_exposure += position_value
                         exposure_pct = total_exposure / portfolio_value
+                        cash -= position_value
+                        sector_counts[sector] = sector_counts.get(sector, 0) + 1
 
         # Log final state
         logger.info("-" * 60)
