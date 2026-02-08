@@ -49,29 +49,44 @@ class PositionState:
     def __init__(self, filepath: str = "positions.json"):
         self.filepath = filepath
         self.positions: Dict[str, dict] = {}
+        self.cooldowns: Dict[str, str] = {}  # symbol -> ISO timestamp of stop-out
         self._dirty = False  # Track whether in-memory state has unsaved changes
         self.load()
 
     def load(self):
-        """Load position state from disk."""
+        """Load position state from disk. Handles both legacy and new format."""
         if os.path.exists(self.filepath):
             try:
                 with open(self.filepath, 'r') as f:
-                    self.positions = json.load(f)
+                    data = json.load(f)
+                # New format: {"positions": {...}, "cooldowns": {...}}
+                if isinstance(data, dict) and 'positions' in data and isinstance(data['positions'], dict):
+                    self.positions = data['positions']
+                    self.cooldowns = data.get('cooldowns', {})
+                else:
+                    # Legacy format: flat dict of positions
+                    self.positions = data
+                    self.cooldowns = {}
                 logger.info(f"Loaded {len(self.positions)} position states from {self.filepath}")
             except (json.JSONDecodeError, IOError) as e:
                 logger.warning(f"Could not load positions file: {e}")
                 self.positions = {}
+                self.cooldowns = {}
         else:
             logger.info("No existing positions file found, starting fresh")
             self.positions = {}
+            self.cooldowns = {}
         self._dirty = False
 
     def save(self):
-        """Save position state to disk."""
+        """Save position state to disk (new format with cooldowns)."""
         try:
+            data = {
+                'positions': self.positions,
+                'cooldowns': self.cooldowns
+            }
             with open(self.filepath, 'w') as f:
-                json.dump(self.positions, f, indent=2, default=str)
+                json.dump(data, f, indent=2, default=str)
             self._dirty = False
         except IOError as e:
             logger.error(f"Failed to save positions file: {e}")
@@ -81,9 +96,30 @@ class PositionState:
         if self._dirty:
             self.save()
 
+    def record_stop_out(self, symbol: str):
+        """Record that a symbol was stopped out (for cooldown tracking)."""
+        self.cooldowns[symbol] = datetime.now().isoformat()
+        self._dirty = True
+
+    def is_in_cooldown(self, symbol: str, hours: int = 48) -> bool:
+        """Check if a symbol is in post-stop-out cooldown period."""
+        if symbol not in self.cooldowns:
+            return False
+        try:
+            stop_time = datetime.fromisoformat(self.cooldowns[symbol])
+            if datetime.now() - stop_time < timedelta(hours=hours):
+                return True
+            # Cooldown expired, clean up
+            del self.cooldowns[symbol]
+            self._dirty = True
+        except (ValueError, TypeError):
+            del self.cooldowns[symbol]
+            self._dirty = True
+        return False
+
     def update_position(self, symbol: str, entry_price: float, entry_time: datetime,
                         peak_price: float, current_price: float,
-                        entry_atr: float = 0.0):
+                        entry_atr: float = 0.0, entry_type: str = None):
         """Update or create position state. Call flush() to persist."""
         new_peak = max(peak_price, current_price)
 
@@ -94,6 +130,7 @@ class PositionState:
             'peak_price': new_peak,
             'highest_watermark': new_peak,
             'entry_atr': entry_atr if entry_atr > 0 else existing.get('entry_atr', 0.0),
+            'entry_type': entry_type or existing.get('entry_type', 'unknown'),
             'last_updated': datetime.now().isoformat()
         }
         self._dirty = True
@@ -130,8 +167,9 @@ class TechnicalIndicators:
     @staticmethod
     def rsi(series: pd.Series, period: int = 14) -> pd.Series:
         delta = series.diff()
-        gain = delta.where(delta > 0, 0).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        # Wilder's smoothing (alpha=1/period) matches industry-standard RSI
+        gain = delta.where(delta > 0, 0).ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, min_periods=period, adjust=False).mean()
         rs = gain / (loss + 1e-10)
         return 100 - (100 / (1 + rs))
 
@@ -158,7 +196,8 @@ class TechnicalIndicators:
         tr2 = (high - close.shift()).abs()
         tr3 = (low - close.shift()).abs()
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        return tr.rolling(window=period).mean()
+        # Wilder's smoothing for ATR
+        return tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
 
     @staticmethod
     def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
@@ -168,7 +207,8 @@ class TechnicalIndicators:
             (low - close.shift()).abs()
         ], axis=1).max(axis=1)
 
-        atr = tr.rolling(window=period).mean()
+        # Wilder's smoothing throughout ADX calculation
+        atr = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
 
         up_move = high.diff()
         down_move = -low.diff()
@@ -176,11 +216,11 @@ class TechnicalIndicators:
         plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0)
         minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0)
 
-        plus_di = 100 * plus_dm.rolling(period).mean() / (atr + 1e-10)
-        minus_di = 100 * minus_dm.rolling(period).mean() / (atr + 1e-10)
+        plus_di = 100 * plus_dm.ewm(alpha=1/period, min_periods=period, adjust=False).mean() / (atr + 1e-10)
+        minus_di = 100 * minus_dm.ewm(alpha=1/period, min_periods=period, adjust=False).mean() / (atr + 1e-10)
 
         dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10)
-        adx = dx.rolling(period).mean()
+        adx = dx.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
 
         return adx.fillna(20)
 
@@ -317,6 +357,22 @@ class EnhancedTradingBot:
         except Exception as e:
             logger.warning(f"Failed to get pending orders: {e}")
             return set()
+
+    def _cancel_stale_orders(self):
+        """Cancel all open orders at cycle start to prevent stale limit fills."""
+        try:
+            cancelled = self.trading_client.cancel_orders()
+            if cancelled:
+                logger.info(f"Cancelled {len(cancelled)} stale orders at cycle start")
+        except Exception as e:
+            logger.warning(f"Failed to cancel stale orders: {e}")
+
+    def _is_equity_trading_day(self) -> bool:
+        """Check if today is a trading day for equities (skip weekends)."""
+        today = datetime.now()
+        if today.weekday() >= 5:  # Saturday=5, Sunday=6
+            return False
+        return True
 
 
     def get_bars(self, symbol: str, timeframe: str = "15Min", limit: int = 100) -> Optional[pd.DataFrame]:
@@ -458,7 +514,8 @@ class EnhancedTradingBot:
                     'signal': 'BUY',
                     'reason': f'Trending BUY: EMA crossover + MACD (ADX={adx:.1f})',
                     'order_type': 'market',
-                    'limit_price': None
+                    'limit_price': None,
+                    'entry_type': 'trend'
                 }
 
             # Bearish: EMA9 crosses below EMA21
@@ -499,7 +556,8 @@ class EnhancedTradingBot:
                         'signal': 'BUY',
                         'reason': f'Mean Reversion BUY: RSI={rsi:.1f}, at BB lower (ADX={adx:.1f}, stable)',
                         'order_type': 'limit',
-                        'limit_price': current['bb_lower']  # Limit at BB lower
+                        'limit_price': current['bb_lower'],  # Limit at BB lower
+                        'entry_type': 'mr'
                     }
 
             # Overbought at upper Bollinger Band
@@ -528,7 +586,8 @@ class EnhancedTradingBot:
                     'reason': f'Cautious BUY: EMA+MACD+Vol+RSI all confirm (ADX={adx:.1f}, transitional)',
                     'order_type': 'market',
                     'limit_price': None,
-                    'half_size': True  # Flag for run_cycle to use half position size
+                    'half_size': True,  # Flag for run_cycle to use half position size
+                    'entry_type': 'cautious'
                 }
 
             ema_cross_down = (
@@ -644,10 +703,12 @@ class EnhancedTradingBot:
         # Update peak if current price is higher
         if current_price > peak_price:
             peak_price = current_price
+            # Preserve original entry_time from state (don't overwrite with now)
+            original_entry_time = pos_state.get('entry_time', datetime.now()) if pos_state else datetime.now()
             self.position_state.update_position(
                 symbol=symbol,
                 entry_price=entry_price,
-                entry_time=datetime.now(),
+                entry_time=original_entry_time,
                 peak_price=peak_price,
                 current_price=current_price
             )
@@ -924,6 +985,14 @@ class EnhancedTradingBot:
         # Hot-reload config if file changed (picks up watchlist/threshold changes)
         self.reload_config_if_changed()
 
+        # Cancel stale limit orders from previous cycles (prevents fills at outdated prices)
+        self._cancel_stale_orders()
+
+        # Check if equities market is open today (skip equity scans on weekends)
+        equity_trading_day = self._is_equity_trading_day()
+        if not equity_trading_day:
+            logger.info("Weekend: skipping equity scans, crypto only")
+
         # Get account info
         account = self.get_account()
         portfolio_value = account['portfolio_value']
@@ -977,6 +1046,7 @@ class EnhancedTradingBot:
             if self.check_trailing_stop(lookup_symbol, current_price, position,
                                         market_bearish=market_bearish):
                 logger.info(f"TRAILING STOP triggered for {lookup_symbol}")
+                self.position_state.record_stop_out(lookup_symbol)
                 self.close_position(lookup_symbol, unrealized_pl=position['unrealized_pl'])
                 continue
 
@@ -984,6 +1054,16 @@ class EnhancedTradingBot:
             df = self.get_bars(lookup_symbol)
             if df is not None and len(df) > 0:
                 df = self.calculate_indicators(df)
+
+                # MR PROFIT TARGET: Close mean reversion positions at BB middle
+                if pos_state and pos_state.get('entry_type') == 'mr':
+                    bb_middle = df.iloc[-2]['bb_middle']
+                    if current_price >= bb_middle:
+                        logger.info(f"MR TARGET: {lookup_symbol} reached BB middle "
+                                   f"${bb_middle:.2f} (entry_type=mr)")
+                        self.close_position(lookup_symbol, unrealized_pl=position['unrealized_pl'])
+                        continue
+
                 signal = self.generate_signal(df, lookup_symbol)
 
                 if signal['signal'] == 'SELL':
@@ -1045,9 +1125,9 @@ class EnhancedTradingBot:
                 logger.debug(f"Skipping {symbol}: pending order exists")
                 continue
 
-            # Skip equities during restricted hours
+            # Skip equities on weekends and during restricted hours
             is_crypto = '/' in symbol
-            if not is_crypto and skip_equities:
+            if not is_crypto and (not equity_trading_day or skip_equities):
                 continue
 
             # Re-check limits
@@ -1065,6 +1145,11 @@ class EnhancedTradingBot:
             sector = self._get_sector_for_symbol(symbol)
             if sector_counts.get(sector, 0) >= max_sector:
                 logger.debug(f"Skipping {symbol}: sector '{sector}' at max ({max_sector} positions)")
+                continue
+
+            # COOLDOWN: Skip symbols recently stopped out (48h cooldown)
+            if self.position_state.is_in_cooldown(symbol):
+                logger.debug(f"Skipping {symbol}: in 48h post-stop-out cooldown")
                 continue
 
             # Get data
@@ -1126,14 +1211,15 @@ class EnhancedTradingBot:
                     )
 
                     if success:
-                        # Initialize position state with entry ATR for initial stop
+                        # Initialize position state with entry ATR and type
                         self.position_state.update_position(
                             symbol=symbol,
                             entry_price=current_price,
                             entry_time=datetime.now(),
                             peak_price=current_price,
                             current_price=current_price,
-                            entry_atr=entry_atr
+                            entry_atr=entry_atr,
+                            entry_type=signal.get('entry_type', 'trend')
                         )
 
                         current_position_count += 1

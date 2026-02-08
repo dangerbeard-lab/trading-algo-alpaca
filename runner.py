@@ -191,7 +191,17 @@ def load_and_verify_state(config_path: str = "config.json"):
     if os.path.exists(positions_file):
         try:
             with open(positions_file, 'r') as f:
-                positions = json.load(f)
+                data = json.load(f)
+
+            # Handle both new format {"positions": {...}, "cooldowns": {...}}
+            # and legacy format (flat dict of positions)
+            if isinstance(data, dict) and 'positions' in data and isinstance(data['positions'], dict):
+                positions = data['positions']
+                cooldowns = data.get('cooldowns', {})
+                if cooldowns:
+                    logger.info(f"  Active cooldowns: {list(cooldowns.keys())}")
+            else:
+                positions = data
 
             logger.info(f"Loaded {len(positions)} position states from {positions_file}")
 
@@ -342,6 +352,20 @@ def show_positions(config_path: str = "config.json"):
     """Display current position states."""
     positions = load_and_verify_state(config_path)
 
+    # Also load cooldowns from the file directly
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+    positions_file = config['persistence'].get('positions_file', 'positions.json')
+    cooldowns = {}
+    if os.path.exists(positions_file):
+        try:
+            with open(positions_file, 'r') as f:
+                data = json.load(f)
+            if isinstance(data, dict) and 'cooldowns' in data:
+                cooldowns = data['cooldowns']
+        except (json.JSONDecodeError, IOError):
+            pass
+
     print("\n" + "=" * 60)
     print(" POSITION STATES (Persistent)")
     print("=" * 60)
@@ -353,18 +377,26 @@ def show_positions(config_path: str = "config.json"):
             entry = state.get('entry_price', 'N/A')
             peak = state.get('peak_price', 'N/A')
             entry_time = state.get('entry_time', 'N/A')
+            entry_type = state.get('entry_type', 'unknown')
 
             if isinstance(entry, (int, float)) and isinstance(peak, (int, float)):
                 gain_from_entry = (peak - entry) / entry * 100
                 entry_atr = state.get('entry_atr', 0)
-                print(f"  {symbol}:")
+                print(f"  {symbol} [{entry_type}]:")
                 print(f"    Entry: ${entry:.2f} @ {entry_time[:16] if isinstance(entry_time, str) else 'N/A'}")
                 print(f"    Peak:  ${peak:.2f} (+{gain_from_entry:.1f}% from entry)")
                 print(f"    Trailing stop: ${peak * 0.88:.2f} (12% base, adaptive in bearish)")
                 if entry_atr > 0:
                     print(f"    Initial stop:  ${entry - entry_atr * 2:.2f} (2x ATR=${entry_atr:.2f})")
+                if entry_type == 'mr':
+                    print(f"    Profit target: BB middle (mean reversion)")
             else:
                 print(f"  {symbol}: {state}")
+
+    if cooldowns:
+        print("\n  COOLDOWNS (48h post-stop-out):")
+        for symbol, timestamp in cooldowns.items():
+            print(f"    {symbol}: stopped out at {timestamp[:16]}")
 
     print("=" * 60 + "\n")
 
