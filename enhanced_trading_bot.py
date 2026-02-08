@@ -23,14 +23,10 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 import pandas as pd
-import numpy as np
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import (
-    MarketOrderRequest, LimitOrderRequest,
-    GetAssetsRequest, ClosePositionRequest
-)
-from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, AssetStatus
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -220,6 +216,14 @@ class EnhancedTradingBot:
         self.crypto_symbols = [s for s in self.watchlist if '/' in s]
         self.equity_symbols = [s for s in self.watchlist if '/' not in s]
 
+        # Build reverse lookup: "BTCUSD" -> "BTC/USD" for normalizing Alpaca symbols
+        self._crypto_symbol_map = {}
+        for s in self.crypto_symbols:
+            self._crypto_symbol_map[s.replace('/', '')] = s
+
+        # Track trades executed this cycle for metrics
+        self.cycle_trades: List[dict] = []
+
         logger.info(f"Initialized bot with {len(self.watchlist)} symbols")
         logger.info(f"  Crypto: {len(self.crypto_symbols)}, Equities: {len(self.equity_symbols)}")
 
@@ -229,6 +233,16 @@ class EnhancedTradingBot:
         for category, symbols in self.config['watchlist'].items():
             watchlist.extend(symbols)
         return watchlist
+
+    def _normalize_symbol(self, alpaca_symbol: str) -> str:
+        """
+        Convert Alpaca position symbol to our watchlist format.
+        Alpaca returns crypto as 'BTCUSD', we store as 'BTC/USD'.
+        Equities are unchanged.
+        """
+        if alpaca_symbol in self._crypto_symbol_map:
+            return self._crypto_symbol_map[alpaca_symbol]
+        return alpaca_symbol
 
     def get_account(self) -> dict:
         """Get account information."""
@@ -288,7 +302,13 @@ class EnhancedTradingBot:
             tf = tf_map.get(timeframe, TimeFrame(15, TimeFrameUnit.Minute))
 
             end = datetime.now()
-            start = end - timedelta(days=10)  # Enough for 100 bars
+            # Scale lookback window based on timeframe
+            # Daily bars need ~100 calendar days for 50 trading days
+            # Intraday bars need ~10 days for 100 bars
+            if timeframe == '1Day':
+                start = end - timedelta(days=max(limit * 2, 100))
+            else:
+                start = end - timedelta(days=10)
 
             if '/' in symbol:  # Crypto
                 request = CryptoBarsRequest(
@@ -649,13 +669,24 @@ class EnhancedTradingBot:
             logger.error(f"Failed to execute {side} order for {symbol}: {e}")
             return False
 
-    def close_position(self, symbol: str) -> bool:
-        """Close an entire position."""
+    def close_position(self, symbol: str, unrealized_pl: float = 0.0) -> bool:
+        """Close an entire position and record the trade."""
         try:
             clean_symbol = symbol.replace('/', '')
             self.trading_client.close_position(clean_symbol)
+
+            # Record trade for metrics
+            pos_state = self.position_state.get_position(symbol)
+            self.cycle_trades.append({
+                'symbol': symbol,
+                'side': 'SELL',
+                'pnl': unrealized_pl,
+                'entry_price': pos_state.get('entry_price', 0) if pos_state else 0,
+                'time': datetime.now().isoformat()
+            })
+
             self.position_state.remove_position(symbol)
-            logger.info(f"Closed position: {symbol}")
+            logger.info(f"Closed position: {symbol} (PnL: ${unrealized_pl:,.2f})")
             return True
         except Exception as e:
             logger.error(f"Failed to close position {symbol}: {e}")
@@ -866,8 +897,8 @@ class EnhancedTradingBot:
 
         # ========== CHECK EXISTING POSITIONS FOR EXITS ==========
         for symbol, position in positions.items():
-            # Normalize symbol for matching
-            lookup_symbol = symbol if '/' not in symbol else f"{symbol[:3]}/{symbol[3:]}"
+            # Normalize Alpaca symbol (e.g., "BTCUSD" -> "BTC/USD") for state/data lookup
+            lookup_symbol = self._normalize_symbol(symbol)
 
             current_price = position['current_price']
 
@@ -894,8 +925,8 @@ class EnhancedTradingBot:
             # ADAPTIVE trailing stop: tightens in bearish market
             if self.check_trailing_stop(lookup_symbol, current_price, position,
                                         market_bearish=market_bearish):
-                logger.info(f"TRAILING STOP triggered for {symbol}")
-                self.close_position(symbol)
+                logger.info(f"TRAILING STOP triggered for {lookup_symbol}")
+                self.close_position(lookup_symbol, unrealized_pl=position['unrealized_pl'])
                 continue
 
             # Get data for signal check
@@ -905,8 +936,8 @@ class EnhancedTradingBot:
                 signal = self.generate_signal(df, lookup_symbol)
 
                 if signal['signal'] == 'SELL':
-                    logger.info(f"SELL signal for {symbol}: {signal['reason']}")
-                    self.close_position(symbol)
+                    logger.info(f"SELL signal for {lookup_symbol}: {signal['reason']}")
+                    self.close_position(lookup_symbol, unrealized_pl=position['unrealized_pl'])
 
         # ========== PRE-ENTRY CHECKS ==========
         # Refresh positions after exits
@@ -947,11 +978,17 @@ class EnhancedTradingBot:
         account = self.get_account()
         cash = account['cash']
 
+        # Build set of symbols already in portfolio (both Alpaca and watchlist format)
+        held_symbols = set()
+        for s in positions:
+            held_symbols.add(s)
+            held_symbols.add(self._normalize_symbol(s))
+
         # ========== SCAN FOR NEW ENTRIES ==========
         for symbol in self.watchlist:
             # Skip if already in position OR has pending order
             clean_symbol = symbol.replace('/', '')
-            if clean_symbol in positions or symbol in positions:
+            if symbol in held_symbols or clean_symbol in held_symbols:
                 continue
             if clean_symbol in pending_symbols or symbol in pending_symbols:
                 logger.debug(f"Skipping {symbol}: pending order exists")

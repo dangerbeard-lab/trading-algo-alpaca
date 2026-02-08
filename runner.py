@@ -79,8 +79,8 @@ class TradingMetrics:
         except IOError as e:
             logger.error(f"Failed to save metrics: {e}")
 
-    def record_cycle(self, portfolio_value: float):
-        """Record a completed cycle."""
+    def record_cycle(self, portfolio_value: float, trades: list = None):
+        """Record a completed cycle and any trades that occurred."""
         self.metrics['total_cycles'] += 1
 
         if portfolio_value > self.metrics['peak_portfolio_value']:
@@ -90,6 +90,18 @@ class TradingMetrics:
             drawdown = (self.metrics['peak_portfolio_value'] - portfolio_value) / self.metrics['peak_portfolio_value']
             if drawdown > self.metrics['max_drawdown']:
                 self.metrics['max_drawdown'] = drawdown
+
+        # Record individual trade metrics
+        if trades:
+            for trade in trades:
+                if trade.get('side') == 'SELL':
+                    self.metrics['total_trades'] += 1
+                    pnl = trade.get('pnl', 0)
+                    self.metrics['total_pnl'] += pnl
+                    if pnl > 0:
+                        self.metrics['winning_trades'] += 1
+                    elif pnl < 0:
+                        self.metrics['losing_trades'] += 1
 
         self.save()
 
@@ -268,18 +280,36 @@ def run_continuous(config_path: str = "config.json", interval: Optional[int] = N
             cycle_start = datetime.now()
             logger.info(f"Starting cycle at {cycle_start.strftime('%Y-%m-%d %H:%M:%S')}")
 
-            # Initialize bot fresh each cycle (but state is persistent)
-            bot = EnhancedTradingBot(config_path)
+            # Acquire file lock to prevent concurrent cycle execution
+            lock_fd = None
+            try:
+                lock_fd = open(LOCK_FILE, 'w')
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (IOError, OSError):
+                logger.warning("Another cycle is already running, skipping this interval")
+                if lock_fd:
+                    lock_fd.close()
+                wait_for_next_interval(interval)
+                continue
 
-            # Run cycle
-            bot.run_cycle()
+            try:
+                # Initialize bot fresh each cycle (but state is persistent)
+                bot = EnhancedTradingBot(config_path)
 
-            # Mark this interval as complete
-            mark_interval_complete(interval)
+                # Run cycle
+                bot.run_cycle()
 
-            # Record metrics
-            account = bot.get_account()
-            metrics.record_cycle(account['portfolio_value'])
+                # Mark this interval as complete
+                mark_interval_complete(interval)
+
+                # Record metrics
+                account = bot.get_account()
+                metrics.record_cycle(account['portfolio_value'], bot.cycle_trades)
+            finally:
+                # Release file lock
+                if lock_fd:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    lock_fd.close()
 
             # Wait for next interval
             if not killer.kill_now:
@@ -326,10 +356,13 @@ def show_positions(config_path: str = "config.json"):
 
             if isinstance(entry, (int, float)) and isinstance(peak, (int, float)):
                 gain_from_entry = (peak - entry) / entry * 100
+                entry_atr = state.get('entry_atr', 0)
                 print(f"  {symbol}:")
                 print(f"    Entry: ${entry:.2f} @ {entry_time[:16] if isinstance(entry_time, str) else 'N/A'}")
                 print(f"    Peak:  ${peak:.2f} (+{gain_from_entry:.1f}% from entry)")
-                print(f"    Stop:  ${peak * 0.88:.2f} (12% trailing)")
+                print(f"    Trailing stop: ${peak * 0.88:.2f} (12% base, adaptive in bearish)")
+                if entry_atr > 0:
+                    print(f"    Initial stop:  ${entry - entry_atr * 2:.2f} (2x ATR=${entry_atr:.2f})")
             else:
                 print(f"  {symbol}: {state}")
 
