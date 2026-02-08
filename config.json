@@ -8,7 +8,9 @@
     "financials": ["JPM", "V", "MA", "BLK", "GS", "BAC"],
     "energy_industrial": ["XLE", "CVX", "XOM", "CAT", "GE", "DE"],
     "pharma": ["LLY", "UNH", "JNJ", "PFE", "ABBV"],
-    "commodities_bonds": ["GLD", "SLV", "TLT", "URA", "DBA", "UNG"],
+    "commodities": ["GLD", "SLV", "PPLT", "URA", "DBA", "UNG", "CPER", "WEAT"],
+    "bonds": ["TLT", "IEF", "SHY", "AGG", "HYG", "GOVT"],
+    "defensives": ["XLU", "XLP", "VIG", "SCHD"],
     "etfs": ["SPY", "QQQ", "IWM"]
   },
 

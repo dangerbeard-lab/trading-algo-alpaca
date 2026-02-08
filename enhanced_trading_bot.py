@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-Enhanced Trading Bot v3.0
+Enhanced Trading Bot v3.1
 =========================
 Multi-asset hybrid strategy with down-market optimizations:
 - Lookahead bias fix (uses closed candles only)
 - State persistence (positions.json)
 - Fractional share support
-- Adaptive trailing stop (tightens in bearish markets)
+- Two-phase stop: initial 2x ATR stop + adaptive trailing stop
 - ATR-based position sizing using CASH (not portfolio_value)
-- Limit orders for mean reversion
+- Limit orders for mean reversion (with ADX stability check)
 - SPY market trend filter (blocks equity longs in downtrends)
 - Daily timeframe trend confirmation
 - Portfolio drawdown circuit breaker
 - Sector exposure limits (max correlated positions)
+- ADX transitional zone (20-25) signals at half size
+- Diversified watchlist: commodities, bonds, defensives
 """
 
 import os
@@ -76,15 +78,18 @@ class PositionState:
             logger.error(f"Failed to save positions file: {e}")
 
     def update_position(self, symbol: str, entry_price: float, entry_time: datetime,
-                        peak_price: float, current_price: float):
+                        peak_price: float, current_price: float,
+                        entry_atr: float = 0.0):
         """Update or create position state and save immediately."""
         new_peak = max(peak_price, current_price)
 
+        existing = self.positions.get(symbol, {})
         self.positions[symbol] = {
             'entry_price': entry_price,
             'entry_time': entry_time.isoformat() if isinstance(entry_time, datetime) else entry_time,
             'peak_price': new_peak,
             'highest_watermark': new_peak,
+            'entry_atr': entry_atr if entry_atr > 0 else existing.get('entry_atr', 0.0),
             'last_updated': datetime.now().isoformat()
         }
         self.save()  # Persist immediately
@@ -411,20 +416,67 @@ class EnhancedTradingBot:
         elif is_ranging:
             rsi = current['rsi']
 
+            # Safety check: ADX must be stable or falling for mean reversion buys.
+            # Rising ADX = transitioning to trending regime = falling knife risk.
+            prev_adx = previous['adx']
+            adx_rising = adx > prev_adx + 1.0  # ADX increased by >1 point
+
             # Oversold at lower Bollinger Band - use LIMIT ORDER
             if rsi < cfg['rsi_oversold'] and current['close'] <= current['bb_lower']:
-                signal = {
-                    'signal': 'BUY',
-                    'reason': f'Mean Reversion BUY: RSI={rsi:.1f}, at BB lower (ADX={adx:.1f})',
-                    'order_type': 'limit',
-                    'limit_price': current['bb_lower']  # Limit at BB lower
-                }
+                if adx_rising:
+                    signal = {
+                        'signal': 'HOLD',
+                        'reason': f'Mean Reversion blocked: ADX rising ({prev_adx:.1f}->{adx:.1f}), regime may be shifting',
+                        'order_type': 'market',
+                        'limit_price': None
+                    }
+                else:
+                    signal = {
+                        'signal': 'BUY',
+                        'reason': f'Mean Reversion BUY: RSI={rsi:.1f}, at BB lower (ADX={adx:.1f}, stable)',
+                        'order_type': 'limit',
+                        'limit_price': current['bb_lower']  # Limit at BB lower
+                    }
 
             # Overbought at upper Bollinger Band
             elif rsi > cfg['rsi_overbought'] and current['close'] >= current['bb_upper']:
                 signal = {
                     'signal': 'SELL',
                     'reason': f'Mean Reversion SELL: RSI={rsi:.1f}, at BB upper (ADX={adx:.1f})',
+                    'order_type': 'market',
+                    'limit_price': None
+                }
+
+        # ========== TRANSITIONAL ZONE: ADX 20-25 (cautious trend-following) ==========
+        elif not is_trending and not is_ranging:
+            # ADX between thresholds - market is ambiguous.
+            # Allow trend signals but require ALL confirmations and flag for half size.
+            ema_cross_up = (
+                previous['ema_short'] <= previous['ema_long'] and
+                current['ema_short'] > current['ema_long']
+            )
+            macd_bullish = current['macd'] > current['macd_signal']
+            rsi_not_overbought = current['rsi'] < cfg['rsi_overbought']
+
+            if ema_cross_up and macd_bullish and volume_confirmed and rsi_not_overbought:
+                signal = {
+                    'signal': 'BUY',
+                    'reason': f'Cautious BUY: EMA+MACD+Vol+RSI all confirm (ADX={adx:.1f}, transitional)',
+                    'order_type': 'market',
+                    'limit_price': None,
+                    'half_size': True  # Flag for run_cycle to use half position size
+                }
+
+            ema_cross_down = (
+                previous['ema_short'] >= previous['ema_long'] and
+                current['ema_short'] < current['ema_long']
+            )
+            macd_bearish = current['macd'] < current['macd_signal']
+
+            if ema_cross_down and macd_bearish:
+                signal = {
+                    'signal': 'SELL',
+                    'reason': f'Cautious SELL: EMA crossover + MACD (ADX={adx:.1f}, transitional)',
                     'order_type': 'market',
                     'limit_price': None
                 }
@@ -478,23 +530,40 @@ class EnhancedTradingBot:
     def check_trailing_stop(self, symbol: str, current_price: float, position: dict,
                              market_bearish: bool = False) -> bool:
         """
-        Adaptive trailing stop that tightens in bearish/volatile conditions.
+        Two-phase stop system:
+        1. INITIAL STOP: 2x ATR below entry (tight, protects fresh entries)
+        2. TRAILING STOP: adaptive % from peak (kicks in once position is profitable)
 
-        Base stop: trailing_stop_pct from config (12%)
-        Adjustments:
-        - Tightens to 8% when broad market (SPY) is bearish
-        - Tightens further based on ATR volatility of the symbol
-        - Loosens slightly for positions with large unrealized gains (let winners run)
+        The initial stop prevents the old problem where buying into an immediate
+        drop required waiting for a full 12% decline before exiting.
 
-        Updates peak price in persistent state.
+        Once price exceeds entry, the trailing stop takes over with adaptive logic:
+        - Base: trailing_stop_pct from config (12%)
+        - Tightens to 8% when SPY is bearish
+        - Ratchets tighter for positions with >15% unrealized gains
         """
         cfg = self.config['risk_management']
         base_stop_pct = cfg['trailing_stop_pct']  # 0.12 = 12%
+        atr_multiplier = cfg.get('atr_risk_multiplier', 2.0)
 
         entry_price = position['avg_entry_price']
         unrealized_plpc = position.get('unrealized_plpc', 0)
 
-        # ---- Adaptive stop calculation ----
+        # Get position state for entry_atr
+        pos_state = self.position_state.get_position(symbol)
+        entry_atr = pos_state.get('entry_atr', 0.0) if pos_state else 0.0
+
+        # ---- PHASE 1: Initial ATR stop (for positions not yet in profit) ----
+        if entry_atr > 0 and current_price <= entry_price:
+            initial_stop = entry_price - (atr_multiplier * entry_atr)
+            if current_price <= initial_stop:
+                loss_pct = (entry_price - current_price) / entry_price
+                logger.info(f"{symbol}: INITIAL STOP hit! Entry=${entry_price:.2f}, "
+                           f"Current=${current_price:.2f}, Stop=${initial_stop:.2f} "
+                           f"(2x ATR=${entry_atr:.2f}, loss={loss_pct:.1%})")
+                return True
+
+        # ---- PHASE 2: Adaptive trailing stop (for all positions) ----
         trailing_stop_pct = base_stop_pct
 
         # Tighten stop in bearish market: 12% -> 8%
@@ -503,7 +572,6 @@ class EnhancedTradingBot:
 
         # Ratchet tighter for positions with gains > 15% (protect profits)
         if unrealized_plpc > 0.15:
-            # E.g. at 20% gain, stop tightens from 12% to ~9%
             trailing_stop_pct = min(trailing_stop_pct, max(0.06, base_stop_pct - unrealized_plpc * 0.2))
 
         # Get or initialize peak price from persistent state
@@ -515,7 +583,7 @@ class EnhancedTradingBot:
             self.position_state.update_position(
                 symbol=symbol,
                 entry_price=entry_price,
-                entry_time=datetime.now(),  # Will preserve original if exists
+                entry_time=datetime.now(),
                 peak_price=peak_price,
                 current_price=current_price
             )
@@ -929,6 +997,11 @@ class EnhancedTradingBot:
                 # FIX: Size positions using CASH, not portfolio_value (avoid margin leverage)
                 position_value = self.calculate_position_size(symbol, df, cash)
 
+                # Half size for transitional zone (ADX 20-25) signals
+                if signal.get('half_size', False):
+                    position_value *= 0.5
+                    logger.info(f"Half position for {symbol}: ADX transitional zone")
+
                 # Reduce position size when market is uncertain (not strongly bullish)
                 if not market.get('ema21_above_ema50', True):
                     position_value *= 0.6
@@ -948,7 +1021,9 @@ class EnhancedTradingBot:
                         continue
 
                 # Calculate quantity (fractional shares supported)
-                current_price = df.iloc[-2]['close']  # Use closed candle price
+                current_bar = df.iloc[-2]
+                current_price = current_bar['close']  # Use closed candle price
+                entry_atr = current_bar['atr'] if not pd.isna(current_bar['atr']) else 0.0
                 qty = position_value / current_price
 
                 if qty > 0:
@@ -963,13 +1038,14 @@ class EnhancedTradingBot:
                     )
 
                     if success:
-                        # Initialize position state
+                        # Initialize position state with entry ATR for initial stop
                         self.position_state.update_position(
                             symbol=symbol,
                             entry_price=current_price,
                             entry_time=datetime.now(),
                             peak_price=current_price,
-                            current_price=current_price
+                            current_price=current_price,
+                            entry_atr=entry_atr
                         )
 
                         current_position_count += 1
