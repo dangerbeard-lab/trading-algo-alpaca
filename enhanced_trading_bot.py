@@ -427,11 +427,14 @@ class EnhancedTradingBot:
 
         return signal
 
-    def calculate_position_size(self, symbol: str, df: pd.DataFrame, account_value: float) -> float:
+    def calculate_position_size(self, symbol: str, df: pd.DataFrame, cash_balance: float) -> float:
         """
         Calculate position size using ATR-based scaling.
         - Low volatility stocks: up to max_position_pct (10%)
         - High volatility stocks: near base_position_pct (4%)
+
+        IMPORTANT: Uses cash_balance (not portfolio_value or buying_power) to avoid
+        accidental margin/leverage. Margin accounts have 2:1 buying power by default.
         """
         cfg = self.config['risk_management']
 
@@ -444,7 +447,7 @@ class EnhancedTradingBot:
         price = current['close']
 
         if pd.isna(atr) or atr <= 0 or price <= 0:
-            return account_value * base_pct
+            return cash_balance * base_pct
 
         # ATR as percentage of price
         atr_pct = atr / price
@@ -465,9 +468,9 @@ class EnhancedTradingBot:
             vol_position = (atr_pct - 0.01) / vol_range
             position_pct = max_pct - (vol_position * (max_pct - base_pct))
 
-        position_value = account_value * position_pct
+        position_value = cash_balance * position_pct
 
-        logger.debug(f"{symbol}: ATR%={atr_pct:.2%}, Position={position_pct:.1%} (${position_value:,.0f})")
+        logger.debug(f"{symbol}: ATR%={atr_pct:.2%}, Position={position_pct:.1%} of cash (${position_value:,.0f})")
 
         return position_value
 
@@ -603,7 +606,8 @@ class EnhancedTradingBot:
         # Get account info
         account = self.get_account()
         portfolio_value = account['portfolio_value']
-        logger.info(f"Portfolio Value: ${portfolio_value:,.2f}")
+        cash = account['cash']
+        logger.info(f"Portfolio Value: ${portfolio_value:,.2f}, Cash: ${cash:,.2f}")
 
         # Get current positions
         positions = self.get_positions()
@@ -716,8 +720,8 @@ class EnhancedTradingBot:
             signal = self.generate_signal(df, symbol)
 
             if signal['signal'] == 'BUY':
-                # Calculate position size
-                position_value = self.calculate_position_size(symbol, df, portfolio_value)
+                # Calculate position size using CASH (not portfolio_value) to avoid leverage
+                position_value = self.calculate_position_size(symbol, df, cash)
 
                 # Check if this would exceed max exposure
                 new_exposure = (total_exposure + position_value) / portfolio_value
