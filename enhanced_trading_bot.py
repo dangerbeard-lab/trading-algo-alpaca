@@ -221,6 +221,15 @@ class EnhancedTradingBot:
             watchlist.extend(symbols)
         return watchlist
 
+    def _normalize_symbol(self, symbol: str) -> str:
+        """
+        Normalize symbol format for consistent tracking.
+        Alpaca returns crypto as BTCUSD, but we use BTC/USD in watchlist.
+        """
+        if '/' not in symbol and symbol.endswith('USD'):
+            return f"{symbol[:-3]}/{symbol[-3:]}"  # BTCUSD -> BTC/USD
+        return symbol
+
     def get_account(self) -> dict:
         """Get account information."""
         account = self.trading_client.get_account()
@@ -623,8 +632,8 @@ class EnhancedTradingBot:
 
         # ========== CHECK EXISTING POSITIONS FOR EXITS ==========
         for symbol, position in positions.items():
-            # Normalize symbol for matching
-            lookup_symbol = symbol if '/' not in symbol else f"{symbol[:3]}/{symbol[3:]}"
+            # Normalize crypto symbols: Alpaca returns BTCUSD, we use BTC/USD
+            lookup_symbol = self._normalize_symbol(symbol)
 
             current_price = position['current_price']
 
