@@ -102,6 +102,33 @@ class PositionState:
             return max(pos.get('peak_price', current_price), current_price)
         return current_price
 
+    def cleanup_stale_positions(self, active_symbols: set, normalize_fn=None):
+        """
+        Remove position states that no longer exist in Alpaca.
+        active_symbols: set of symbols currently held in Alpaca
+        normalize_fn: optional function to normalize symbol format
+        """
+        # Normalize active symbols for comparison
+        normalized_active = set()
+        for sym in active_symbols:
+            if normalize_fn:
+                normalized_active.add(normalize_fn(sym))
+            else:
+                normalized_active.add(sym)
+
+        # Find stale entries
+        stale = []
+        for tracked_symbol in self.positions.keys():
+            if tracked_symbol not in normalized_active:
+                stale.append(tracked_symbol)
+
+        # Remove stale entries
+        if stale:
+            for symbol in stale:
+                del self.positions[symbol]
+            self.save()
+            logger.info(f"Cleaned up {len(stale)} stale position states: {stale}")
+
 
 class TechnicalIndicators:
     """Calculate technical indicators for signal generation."""
@@ -622,6 +649,12 @@ class EnhancedTradingBot:
         positions = self.get_positions()
         current_position_count = len(positions)
         logger.info(f"Current Positions: {current_position_count}")
+
+        # Cleanup stale position states (sync with Alpaca)
+        self.position_state.cleanup_stale_positions(
+            active_symbols=set(positions.keys()),
+            normalize_fn=self._normalize_symbol
+        )
 
         # Calculate current exposure
         total_exposure = sum(p['market_value'] for p in positions.values())
