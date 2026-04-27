@@ -40,7 +40,9 @@
     "max_portfolio_exposure": 0.90,
     "base_position_pct": 0.04,
     "max_position_pct": 0.10,
-    "atr_risk_multiplier": 2.0,
+    "atr_risk_multiplier": 3.0,
+    "atr_risk_multiplier_crypto": 3.5,
+    "min_hold_bars": 2,
     "max_correlated_positions": 5,
     "correlation_threshold": 0.7
   },

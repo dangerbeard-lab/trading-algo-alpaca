@@ -45,8 +45,10 @@ class Position:
     entry_price: float
     entry_time: datetime
     entry_atr: float
-    entry_type: str  # 'trend', 'mr', 'cautious'
+    entry_type: str  # 'trend', 'mr'
     peak_price: float
+    entry_bb_lower: float = 0.0
+    bars_held: int = 0
 
 
 @dataclass
@@ -230,17 +232,6 @@ class Backtester:
                 return {"signal": "SELL", "reason": f"MR SELL: RSI={rsi:.1f}",
                         "order_type": "market", "limit_price": None, "entry_type": "mr"}
 
-        else:  # Transitional zone
-            ema_cross_up = (previous["ema_short"] <= previous["ema_long"]
-                            and current["ema_short"] > current["ema_long"])
-            macd_bullish = current["macd"] > current["macd_signal"]
-            rsi_not_overbought = current["rsi"] < cfg["rsi_overbought"]
-
-            if ema_cross_up and macd_bullish and volume_confirmed and rsi_not_overbought:
-                return {"signal": "BUY", "reason": f"Cautious BUY (ADX={adx:.1f})",
-                        "order_type": "market", "limit_price": None,
-                        "entry_type": "cautious", "half_size": True}
-
         return signal
 
     def _check_market_trend(self, t: datetime) -> dict:
@@ -354,13 +345,23 @@ class Backtester:
         pos = self.positions[symbol]
         cfg = self.config["risk_management"]
         base_stop_pct = cfg["trailing_stop_pct"]
-        atr_mult = cfg.get("atr_risk_multiplier", 2.0)
+        min_hold = cfg.get("min_hold_bars", 2)
 
-        # Phase 1: Initial ATR stop
-        if pos.entry_atr > 0 and current_price <= pos.entry_price:
-            initial_stop = pos.entry_price - (atr_mult * pos.entry_atr)
-            if current_price <= initial_stop:
-                return "initial_atr_stop"
+        # Increment bars held
+        pos.bars_held += 1
+
+        # MR trades use BB lower as stop instead of ATR
+        if pos.entry_type == "mr":
+            if pos.entry_bb_lower > 0 and current_price < pos.entry_bb_lower * 0.98:
+                return "mr_stop"
+        else:
+            # Phase 1: Initial ATR stop (only after minimum hold period)
+            if pos.bars_held > min_hold and pos.entry_atr > 0 and current_price <= pos.entry_price:
+                is_crypto = "/" in symbol
+                atr_mult = cfg.get("atr_risk_multiplier_crypto", 3.5) if is_crypto else cfg.get("atr_risk_multiplier", 3.0)
+                initial_stop = pos.entry_price - (atr_mult * pos.entry_atr)
+                if current_price <= initial_stop:
+                    return "initial_atr_stop"
 
         # Update peak
         if current_price > pos.peak_price:
@@ -400,7 +401,8 @@ class Backtester:
             self.cooldowns[symbol] = t
         del self.positions[symbol]
 
-    def _open_position(self, symbol: str, price: float, t: datetime, signal: dict, qty: float, atr: float):
+    def _open_position(self, symbol: str, price: float, t: datetime, signal: dict,
+                       qty: float, atr: float, bb_lower: float = 0.0):
         # Apply slippage on entry
         fill_price = price * (1 + SLIPPAGE_PCT)
         cost = qty * fill_price
@@ -412,6 +414,7 @@ class Backtester:
             symbol=symbol, qty=qty, entry_price=fill_price,
             entry_time=t, entry_atr=atr,
             entry_type=signal["entry_type"], peak_price=fill_price,
+            entry_bb_lower=bb_lower,
         )
         self.trades.append(Trade(
             symbol=symbol, side="BUY", qty=qty, price=fill_price,
@@ -549,10 +552,9 @@ class Backtester:
                 bar = ind_df.iloc[idx - 1]  # closed candle
                 price = bar["close"]
                 atr = bar["atr"] if not pd.isna(bar["atr"]) else 0.0
+                bb_lower = bar["bb_lower"] if not pd.isna(bar.get("bb_lower", float("nan"))) else 0.0
 
                 position_value = self._calculate_position_size(atr, price, self.cash)
-                if signal.get("half_size"):
-                    position_value *= 0.5
                 if not market.get("ema21_above_ema50", True):
                     position_value *= 0.6
 
@@ -579,7 +581,7 @@ class Backtester:
                     fill_price = limit_price
 
                 qty = position_value / fill_price
-                if self._open_position(symbol, fill_price, t, signal, qty, atr):
+                if self._open_position(symbol, fill_price, t, signal, qty, atr, bb_lower=bb_lower):
                     pos_val += position_value
                     sector_counts[sector] = sector_counts.get(sector, 0) + 1
                     if len(self.positions) >= max_positions:

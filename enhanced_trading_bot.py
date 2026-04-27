@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-Enhanced Trading Bot v3.1
+Enhanced Trading Bot v4.0
 =========================
 Multi-asset hybrid strategy with down-market optimizations:
 - Lookahead bias fix (uses closed candles only)
 - State persistence (positions.json)
 - Fractional share support
-- Two-phase stop: initial 2x ATR stop + adaptive trailing stop
+- Two-phase stop: initial 3x ATR (stocks) / 3.5x ATR (crypto) + adaptive trailing
+- Minimum hold time (2 bars) before initial stop can fire
+- MR trades: BB lower band stop instead of ATR stop
 - ATR-based position sizing using CASH (not portfolio_value)
 - Limit orders for mean reversion (with ADX stability check)
 - SPY market trend filter (blocks equity longs in downtrends)
 - Daily timeframe trend confirmation
 - Portfolio drawdown circuit breaker
 - Sector exposure limits (max correlated positions)
-- ADX transitional zone (20-25) signals at half size
 - Diversified watchlist: commodities, bonds, defensives
 """
 
@@ -569,41 +570,6 @@ class EnhancedTradingBot:
                     'limit_price': None
                 }
 
-        # ========== TRANSITIONAL ZONE: ADX 20-25 (cautious trend-following) ==========
-        elif not is_trending and not is_ranging:
-            # ADX between thresholds - market is ambiguous.
-            # Allow trend signals but require ALL confirmations and flag for half size.
-            ema_cross_up = (
-                previous['ema_short'] <= previous['ema_long'] and
-                current['ema_short'] > current['ema_long']
-            )
-            macd_bullish = current['macd'] > current['macd_signal']
-            rsi_not_overbought = current['rsi'] < cfg['rsi_overbought']
-
-            if ema_cross_up and macd_bullish and volume_confirmed and rsi_not_overbought:
-                signal = {
-                    'signal': 'BUY',
-                    'reason': f'Cautious BUY: EMA+MACD+Vol+RSI all confirm (ADX={adx:.1f}, transitional)',
-                    'order_type': 'market',
-                    'limit_price': None,
-                    'half_size': True,  # Flag for run_cycle to use half position size
-                    'entry_type': 'cautious'
-                }
-
-            ema_cross_down = (
-                previous['ema_short'] >= previous['ema_long'] and
-                current['ema_short'] < current['ema_long']
-            )
-            macd_bearish = current['macd'] < current['macd_signal']
-
-            if ema_cross_down and macd_bearish:
-                signal = {
-                    'signal': 'SELL',
-                    'reason': f'Cautious SELL: EMA crossover + MACD (ADX={adx:.1f}, transitional)',
-                    'order_type': 'market',
-                    'limit_price': None
-                }
-
         return signal
 
     def calculate_position_size(self, symbol: str, df: pd.DataFrame, account_value: float) -> float:
@@ -667,24 +633,44 @@ class EnhancedTradingBot:
         """
         cfg = self.config['risk_management']
         base_stop_pct = cfg['trailing_stop_pct']  # 0.12 = 12%
-        atr_multiplier = cfg.get('atr_risk_multiplier', 2.0)
+        min_hold_bars = cfg.get('min_hold_bars', 2)
 
         entry_price = position['avg_entry_price']
         unrealized_plpc = position.get('unrealized_plpc', 0)
 
-        # Get position state for entry_atr
+        # Get position state for entry_atr and entry_type
         pos_state = self.position_state.get_position(symbol)
         entry_atr = pos_state.get('entry_atr', 0.0) if pos_state else 0.0
+        entry_type = pos_state.get('entry_type', 'unknown') if pos_state else 'unknown'
 
-        # ---- PHASE 1: Initial ATR stop (for positions not yet in profit) ----
-        if entry_atr > 0 and current_price <= entry_price:
-            initial_stop = entry_price - (atr_multiplier * entry_atr)
-            if current_price <= initial_stop:
-                loss_pct = (entry_price - current_price) / entry_price
-                logger.info(f"{symbol}: INITIAL STOP hit! Entry=${entry_price:.2f}, "
-                           f"Current=${current_price:.2f}, Stop=${initial_stop:.2f} "
-                           f"(2x ATR=${entry_atr:.2f}, loss={loss_pct:.1%})")
+        # Count bars held (each cycle = 1 bar on 15min timeframe)
+        bars_held = 0
+        if pos_state and pos_state.get('entry_time'):
+            try:
+                entry_time = datetime.fromisoformat(str(pos_state['entry_time']))
+                bars_held = int((datetime.now() - entry_time).total_seconds() / 900)
+            except (ValueError, TypeError):
+                bars_held = 999
+
+        # MR trades: use BB lower as stop instead of ATR
+        if entry_type == 'mr':
+            entry_bb = pos_state.get('entry_bb_lower', 0.0) if pos_state else 0.0
+            if entry_bb > 0 and current_price < entry_bb * 0.98:
+                logger.info(f"{symbol}: MR STOP hit! Below BB lower ${entry_bb:.2f} "
+                           f"(current=${current_price:.2f})")
                 return True
+        else:
+            # Phase 1: Initial ATR stop (only after minimum hold, asset-class multiplier)
+            if bars_held > min_hold_bars and entry_atr > 0 and current_price <= entry_price:
+                is_crypto = '/' in symbol
+                atr_multiplier = cfg.get('atr_risk_multiplier_crypto', 3.5) if is_crypto else cfg.get('atr_risk_multiplier', 3.0)
+                initial_stop = entry_price - (atr_multiplier * entry_atr)
+                if current_price <= initial_stop:
+                    loss_pct = (entry_price - current_price) / entry_price
+                    logger.info(f"{symbol}: INITIAL STOP hit! Entry=${entry_price:.2f}, "
+                               f"Current=${current_price:.2f}, Stop=${initial_stop:.2f} "
+                               f"({atr_multiplier}x ATR=${entry_atr:.2f}, loss={loss_pct:.1%})")
+                    return True
 
         # ---- PHASE 2: Adaptive trailing stop (for all positions) ----
         trailing_stop_pct = base_stop_pct
@@ -1170,11 +1156,6 @@ class EnhancedTradingBot:
                 # FIX: Size positions using CASH, not portfolio_value (avoid margin leverage)
                 position_value = self.calculate_position_size(symbol, df, cash)
 
-                # Half size for transitional zone (ADX 20-25) signals
-                if signal.get('half_size', False):
-                    position_value *= 0.5
-                    logger.info(f"Half position for {symbol}: ADX transitional zone")
-
                 # Reduce position size when market is uncertain (not strongly bullish)
                 if not market.get('ema21_above_ema50', True):
                     position_value *= 0.6
@@ -1211,7 +1192,8 @@ class EnhancedTradingBot:
                     )
 
                     if success:
-                        # Initialize position state with entry ATR and type
+                        # Initialize position state with entry ATR, type, and BB lower for MR
+                        entry_type = signal.get('entry_type', 'trend')
                         self.position_state.update_position(
                             symbol=symbol,
                             entry_price=current_price,
@@ -1219,8 +1201,12 @@ class EnhancedTradingBot:
                             peak_price=current_price,
                             current_price=current_price,
                             entry_atr=entry_atr,
-                            entry_type=signal.get('entry_type', 'trend')
+                            entry_type=entry_type
                         )
+                        if entry_type == 'mr':
+                            pos = self.position_state.get_position(symbol)
+                            if pos:
+                                pos['entry_bb_lower'] = float(current_bar['bb_lower'])
 
                         current_position_count += 1
                         total_exposure += position_value
