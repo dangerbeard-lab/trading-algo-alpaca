@@ -121,8 +121,8 @@ class Backtester:
             if df15 is not None:
                 ts = df15["timestamp"]
                 if ts.dt.tz is not None:
-                    s = pd.Timestamp(start, tz="UTC")
-                    e = pd.Timestamp(end, tz="UTC")
+                    s = pd.Timestamp(start).tz_localize("UTC") if start.tzinfo is None else pd.Timestamp(start)
+                    e = pd.Timestamp(end).tz_localize("UTC") if end.tzinfo is None else pd.Timestamp(end)
                 else:
                     s, e = start, end
                 df15 = df15[(ts >= s) & (ts <= e)]
@@ -134,7 +134,7 @@ class Backtester:
             if dfd is not None:
                 ts = dfd["timestamp"]
                 if ts.dt.tz is not None:
-                    e = pd.Timestamp(end, tz="UTC")
+                    e = pd.Timestamp(end).tz_localize("UTC") if end.tzinfo is None else pd.Timestamp(end)
                 else:
                     e = end
                 dfd = dfd[ts <= e]
