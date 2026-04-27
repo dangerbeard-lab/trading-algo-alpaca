@@ -13,7 +13,7 @@ Set ALPACA_API_KEY and ALPACA_SECRET_KEY env vars before running.
 import argparse
 import logging
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -35,6 +35,9 @@ def compute_spy_benchmark(start: datetime, end: datetime) -> float:
     df = loader.load_bars("SPY", "1Day")
     if df is None:
         return None
+    if df["timestamp"].dt.tz is None:
+        start = start.replace(tzinfo=None)
+        end = end.replace(tzinfo=None)
     df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)]
     if len(df) < 2:
         return None
@@ -63,13 +66,13 @@ def main():
         loader.download_all(months=args.months)
 
     if args.start:
-        start = datetime.strptime(args.start, "%Y-%m-%d")
+        start = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     else:
-        start = datetime.now() - timedelta(days=args.months * 30)
+        start = datetime.now(timezone.utc) - timedelta(days=args.months * 30)
     if args.end:
-        end = datetime.strptime(args.end, "%Y-%m-%d")
+        end = datetime.strptime(args.end, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     else:
-        end = datetime.now()
+        end = datetime.now(timezone.utc)
 
     from backtest.engine import Backtester
     from backtest.metrics import calculate_metrics, print_metrics

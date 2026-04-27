@@ -119,15 +119,25 @@ class Backtester:
         for symbol in symbols_to_load:
             df15 = loader.load_bars(symbol, "15Min")
             if df15 is not None:
-                df15 = df15[(df15["timestamp"] >= start) & (df15["timestamp"] <= end)]
+                ts = df15["timestamp"]
+                if ts.dt.tz is not None:
+                    s = pd.Timestamp(start, tz="UTC")
+                    e = pd.Timestamp(end, tz="UTC")
+                else:
+                    s, e = start, end
+                df15 = df15[(ts >= s) & (ts <= e)]
                 if len(df15) > 0:
                     self.bars_15min[symbol] = df15.reset_index(drop=True)
                     loaded_15 += 1
 
             dfd = loader.load_bars(symbol, "1Day")
             if dfd is not None:
-                # Daily needs more lookback for EMA calculation - keep extra history
-                dfd = dfd[dfd["timestamp"] <= end]
+                ts = dfd["timestamp"]
+                if ts.dt.tz is not None:
+                    e = pd.Timestamp(end, tz="UTC")
+                else:
+                    e = end
+                dfd = dfd[ts <= e]
                 if len(dfd) > 0:
                     self.bars_daily[symbol] = dfd.reset_index(drop=True)
                     loaded_d += 1
