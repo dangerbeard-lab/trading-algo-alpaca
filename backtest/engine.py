@@ -19,7 +19,7 @@ import json
 import logging
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta, time as dtime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -420,12 +420,12 @@ class Backtester:
         return True
 
     def _is_market_hours(self, t: datetime) -> bool:
-        if t.weekday() >= 5:
+        # Convert UTC to approximate ET (UTC-4 for EDT, close enough for filtering)
+        et = t.replace(tzinfo=None) - timedelta(hours=4) if t.tzinfo is not None else t
+        if et.weekday() >= 5:
             return False
-        tt = t.time()
-        skip_open = dtime(MARKET_OPEN.hour, MARKET_OPEN.minute + SKIP_FIRST_MINUTES)
-        skip_close = dtime(MARKET_CLOSE.hour - 1, 60 - SKIP_LAST_MINUTES)
-        return skip_open <= tt <= dtime(15, 30)
+        tt = et.time()
+        return dtime(10, 0) <= tt <= dtime(15, 30)
 
     def _check_drawdown_circuit_breaker(self, current_value: float) -> bool:
         cfg = self.config["risk_management"]
@@ -445,7 +445,9 @@ class Backtester:
         all_times = set()
         for df in self.bars_15min.values():
             all_times.update(df["timestamp"].tolist())
-        cycle_times = sorted(t for t in all_times if start <= t <= end)
+        s_ts = pd.Timestamp(start, tz="UTC") if getattr(start, "tzinfo", None) is None else pd.Timestamp(start)
+        e_ts = pd.Timestamp(end, tz="UTC") if getattr(end, "tzinfo", None) is None else pd.Timestamp(end)
+        cycle_times = sorted(t for t in all_times if s_ts <= t <= e_ts)
         logger.info(f"Cycle timeline: {len(cycle_times)} timestamps")
 
         cfg = self.config["risk_management"]
