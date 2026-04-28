@@ -89,6 +89,40 @@ def calculate_metrics(snapshots: List, trades: List, initial_cash: float, benchm
     # Monthly returns
     monthly = df["value"].resample("ME").last().pct_change().dropna()
 
+    # Trade attribution: winners vs losers by ADX range and sector
+    adx_buckets = {"low_25_30": [], "mid_30_40": [], "high_40+": []}
+    for t in closed_trades:
+        adx = getattr(t, "entry_adx", 0)
+        if adx < 30:
+            adx_buckets["low_25_30"].append(t)
+        elif adx < 40:
+            adx_buckets["mid_30_40"].append(t)
+        else:
+            adx_buckets["high_40+"].append(t)
+    adx_attribution = {}
+    for bucket, trades_list in adx_buckets.items():
+        if trades_list:
+            w = [t for t in trades_list if t.pnl > 0]
+            adx_attribution[bucket] = {
+                "n": len(trades_list),
+                "win_rate": len(w) / len(trades_list),
+                "total_pnl": sum(t.pnl for t in trades_list),
+                "avg_pnl": sum(t.pnl for t in trades_list) / len(trades_list),
+            }
+
+    sector_attribution = defaultdict(list)
+    for t in closed_trades:
+        sec = getattr(t, "sector", "unknown")
+        sector_attribution[sec].append(t)
+    sector_stats = {}
+    for sec, trades_list in sector_attribution.items():
+        w = [t for t in trades_list if t.pnl > 0]
+        sector_stats[sec] = {
+            "n": len(trades_list),
+            "win_rate": len(w) / len(trades_list) if trades_list else 0,
+            "total_pnl": sum(t.pnl for t in trades_list),
+        }
+
     return {
         "initial_cash": initial_cash,
         "final_value": final_value,
@@ -106,6 +140,8 @@ def calculate_metrics(snapshots: List, trades: List, initial_cash: float, benchm
         "exit_breakdown": exit_breakdown,
         "monthly_returns": monthly.to_dict(),
         "benchmark_return": benchmark_return,
+        "adx_attribution": adx_attribution,
+        "sector_attribution": sector_stats,
     }
 
 
@@ -156,6 +192,23 @@ def print_metrics(metrics: dict):
         print(f"  {'Reason':<20} {'N':>5} {'Win%':>8} {'Total PnL':>14}")
         for reason, e in metrics["exit_breakdown"].items():
             print(f"  {reason:<20} {e['n']:>5d} {e['win_rate']:>7.1%} ${e['total_pnl']:>13,.2f}")
+
+    if metrics.get("adx_attribution"):
+        print("\n" + "-" * 70)
+        print(" ENTRY ADX ATTRIBUTION (Winners vs Losers)")
+        print("-" * 70)
+        print(f"  {'ADX Range':<15} {'N':>5} {'Win%':>8} {'Total PnL':>14} {'Avg PnL':>12}")
+        for bucket, a in sorted(metrics["adx_attribution"].items()):
+            print(f"  {bucket:<15} {a['n']:>5d} {a['win_rate']:>7.1%} "
+                  f"${a['total_pnl']:>13,.2f} ${a['avg_pnl']:>11,.2f}")
+
+    if metrics.get("sector_attribution"):
+        print("\n" + "-" * 70)
+        print(" SECTOR ATTRIBUTION")
+        print("-" * 70)
+        print(f"  {'Sector':<20} {'N':>5} {'Win%':>8} {'Total PnL':>14}")
+        for sec, s in sorted(metrics["sector_attribution"].items(), key=lambda x: x[1]["total_pnl"], reverse=True):
+            print(f"  {sec:<20} {s['n']:>5d} {s['win_rate']:>7.1%} ${s['total_pnl']:>13,.2f}")
 
     if metrics.get("monthly_returns"):
         print("\n" + "-" * 70)

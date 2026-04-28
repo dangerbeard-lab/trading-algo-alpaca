@@ -480,30 +480,23 @@ class EnhancedTradingBot:
     def generate_signal(self, df: pd.DataFrame, symbol: str) -> dict:
         """
         Generate trading signal using CLOSED candles only (fix lookahead bias).
-        Uses .iloc[-2] for the last CLOSED candle, not .iloc[-1] (forming candle).
+        Trend-following only: EMA crossover + MACD + entry quality filters.
         """
-        if len(df) < 3:
+        if len(df) < 4:
             return {'signal': 'HOLD', 'reason': 'Insufficient data'}
 
         cfg = self.config['strategy']
 
-        # CRITICAL FIX: Use .iloc[-2] for closed candle (not -1 which is forming)
         current = df.iloc[-2]  # Last CLOSED candle
         previous = df.iloc[-3]  # Previous closed candle
 
         signal = {'signal': 'HOLD', 'reason': '', 'order_type': 'market', 'limit_price': None}
 
-        # Check regime
         adx = current['adx']
         is_trending = adx > cfg['adx_trending_threshold']
-        is_ranging = adx < cfg['adx_ranging_threshold']
-
-        # Volume confirmation
         volume_confirmed = current['volume_ratio'] > cfg['volume_confirmation_multiplier']
 
-        # ========== TRENDING REGIME: EMA Crossover + MACD ==========
         if is_trending:
-            # Bullish: EMA9 crosses above EMA21, MACD confirms
             ema_cross_up = (
                 previous['ema_short'] <= previous['ema_long'] and
                 current['ema_short'] > current['ema_long']
@@ -511,15 +504,22 @@ class EnhancedTradingBot:
             macd_bullish = current['macd'] > current['macd_signal']
 
             if ema_cross_up and macd_bullish and volume_confirmed:
+                macd_expanding = current['macd_hist'] > previous['macd_hist']
+                price_above_mean = current['close'] > df['close'].iloc[-52:-2].mean()
+
+                if not macd_expanding:
+                    return {'signal': 'HOLD', 'reason': f'MACD histogram fading (ADX={adx:.1f})'}
+                if not price_above_mean:
+                    return {'signal': 'HOLD', 'reason': f'Price below 50-bar mean (ADX={adx:.1f})'}
+
                 signal = {
                     'signal': 'BUY',
-                    'reason': f'Trending BUY: EMA crossover + MACD (ADX={adx:.1f})',
+                    'reason': f'Trending BUY: EMA+MACD+expanding (ADX={adx:.1f})',
                     'order_type': 'market',
                     'limit_price': None,
                     'entry_type': 'trend'
                 }
 
-            # Bearish: EMA9 crosses below EMA21
             ema_cross_down = (
                 previous['ema_short'] >= previous['ema_long'] and
                 current['ema_short'] < current['ema_long']
@@ -530,42 +530,6 @@ class EnhancedTradingBot:
                 signal = {
                     'signal': 'SELL',
                     'reason': f'Trending SELL: EMA crossover + MACD (ADX={adx:.1f})',
-                    'order_type': 'market',
-                    'limit_price': None
-                }
-
-        # ========== RANGING REGIME: Mean Reversion with Limit Orders ==========
-        elif is_ranging:
-            rsi = current['rsi']
-
-            # Safety check: ADX must be stable or falling for mean reversion buys.
-            # Rising ADX = transitioning to trending regime = falling knife risk.
-            prev_adx = previous['adx']
-            adx_rising = adx > prev_adx + 1.0  # ADX increased by >1 point
-
-            # Oversold at lower Bollinger Band - use LIMIT ORDER
-            if rsi < cfg['rsi_oversold'] and current['close'] <= current['bb_lower']:
-                if adx_rising:
-                    signal = {
-                        'signal': 'HOLD',
-                        'reason': f'Mean Reversion blocked: ADX rising ({prev_adx:.1f}->{adx:.1f}), regime may be shifting',
-                        'order_type': 'market',
-                        'limit_price': None
-                    }
-                else:
-                    signal = {
-                        'signal': 'BUY',
-                        'reason': f'Mean Reversion BUY: RSI={rsi:.1f}, at BB lower (ADX={adx:.1f}, stable)',
-                        'order_type': 'limit',
-                        'limit_price': current['bb_lower'],  # Limit at BB lower
-                        'entry_type': 'mr'
-                    }
-
-            # Overbought at upper Bollinger Band
-            elif rsi > cfg['rsi_overbought'] and current['close'] >= current['bb_upper']:
-                signal = {
-                    'signal': 'SELL',
-                    'reason': f'Mean Reversion SELL: RSI={rsi:.1f}, at BB upper (ADX={adx:.1f})',
                     'order_type': 'market',
                     'limit_price': None
                 }
@@ -652,25 +616,17 @@ class EnhancedTradingBot:
             except (ValueError, TypeError):
                 bars_held = 999
 
-        # MR trades: use BB lower as stop instead of ATR
-        if entry_type == 'mr':
-            entry_bb = pos_state.get('entry_bb_lower', 0.0) if pos_state else 0.0
-            if entry_bb > 0 and current_price < entry_bb * 0.98:
-                logger.info(f"{symbol}: MR STOP hit! Below BB lower ${entry_bb:.2f} "
-                           f"(current=${current_price:.2f})")
+        # Phase 1: Initial ATR stop (only after minimum hold, asset-class multiplier)
+        if bars_held > min_hold_bars and entry_atr > 0 and current_price <= entry_price:
+            is_crypto = '/' in symbol
+            atr_multiplier = cfg.get('atr_risk_multiplier_crypto', 4.0) if is_crypto else cfg.get('atr_risk_multiplier', 3.5)
+            initial_stop = entry_price - (atr_multiplier * entry_atr)
+            if current_price <= initial_stop:
+                loss_pct = (entry_price - current_price) / entry_price
+                logger.info(f"{symbol}: INITIAL STOP hit! Entry=${entry_price:.2f}, "
+                           f"Current=${current_price:.2f}, Stop=${initial_stop:.2f} "
+                           f"({atr_multiplier}x ATR=${entry_atr:.2f}, loss={loss_pct:.1%})")
                 return True
-        else:
-            # Phase 1: Initial ATR stop (only after minimum hold, asset-class multiplier)
-            if bars_held > min_hold_bars and entry_atr > 0 and current_price <= entry_price:
-                is_crypto = '/' in symbol
-                atr_multiplier = cfg.get('atr_risk_multiplier_crypto', 3.5) if is_crypto else cfg.get('atr_risk_multiplier', 3.0)
-                initial_stop = entry_price - (atr_multiplier * entry_atr)
-                if current_price <= initial_stop:
-                    loss_pct = (entry_price - current_price) / entry_price
-                    logger.info(f"{symbol}: INITIAL STOP hit! Entry=${entry_price:.2f}, "
-                               f"Current=${current_price:.2f}, Stop=${initial_stop:.2f} "
-                               f"({atr_multiplier}x ATR=${entry_atr:.2f}, loss={loss_pct:.1%})")
-                    return True
 
         # ---- PHASE 2: Adaptive trailing stop (for all positions) ----
         trailing_stop_pct = base_stop_pct
@@ -1040,16 +996,6 @@ class EnhancedTradingBot:
             df = self.get_bars(lookup_symbol)
             if df is not None and len(df) > 0:
                 df = self.calculate_indicators(df)
-
-                # MR PROFIT TARGET: Close mean reversion positions at BB middle
-                if pos_state and pos_state.get('entry_type') == 'mr':
-                    bb_middle = df.iloc[-2]['bb_middle']
-                    if current_price >= bb_middle:
-                        logger.info(f"MR TARGET: {lookup_symbol} reached BB middle "
-                                   f"${bb_middle:.2f} (entry_type=mr)")
-                        self.close_position(lookup_symbol, unrealized_pl=position['unrealized_pl'])
-                        continue
-
                 signal = self.generate_signal(df, lookup_symbol)
 
                 if signal['signal'] == 'SELL':
@@ -1192,8 +1138,6 @@ class EnhancedTradingBot:
                     )
 
                     if success:
-                        # Initialize position state with entry ATR, type, and BB lower for MR
-                        entry_type = signal.get('entry_type', 'trend')
                         self.position_state.update_position(
                             symbol=symbol,
                             entry_price=current_price,
@@ -1201,12 +1145,8 @@ class EnhancedTradingBot:
                             peak_price=current_price,
                             current_price=current_price,
                             entry_atr=entry_atr,
-                            entry_type=entry_type
+                            entry_type=signal.get('entry_type', 'trend')
                         )
-                        if entry_type == 'mr':
-                            pos = self.position_state.get_position(symbol)
-                            if pos:
-                                pos['entry_bb_lower'] = float(current_bar['bb_lower'])
 
                         current_position_count += 1
                         total_exposure += position_value

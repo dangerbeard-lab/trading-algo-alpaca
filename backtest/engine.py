@@ -45,10 +45,11 @@ class Position:
     entry_price: float
     entry_time: datetime
     entry_atr: float
-    entry_type: str  # 'trend', 'mr'
+    entry_type: str  # 'trend'
     peak_price: float
-    entry_bb_lower: float = 0.0
     bars_held: int = 0
+    entry_adx: float = 0.0
+    entry_macd_hist: float = 0.0
 
 
 @dataclass
@@ -62,6 +63,9 @@ class Trade:
     pnl: float = 0.0
     hold_hours: float = 0.0
     exit_reason: str = ""
+    entry_adx: float = 0.0
+    entry_macd_hist: float = 0.0
+    sector: str = ""
 
 
 @dataclass
@@ -183,7 +187,7 @@ class Backtester:
 
     def _generate_signal(self, df: pd.DataFrame, idx: int) -> dict:
         """Generate signal using closed candle at idx-1 (matches live bot logic)."""
-        if idx < 2:
+        if idx < 3:
             return {"signal": "HOLD", "reason": "Insufficient data"}
 
         cfg = self.config["strategy"]
@@ -198,7 +202,6 @@ class Backtester:
 
         adx = current["adx"]
         is_trending = adx > cfg["adx_trending_threshold"]
-        is_ranging = adx < cfg["adx_ranging_threshold"]
         volume_confirmed = current["volume_ratio"] > cfg["volume_confirmation_multiplier"]
 
         if is_trending:
@@ -207,8 +210,18 @@ class Backtester:
             macd_bullish = current["macd"] > current["macd_signal"]
 
             if ema_cross_up and macd_bullish and volume_confirmed:
+                # Entry quality filters
+                macd_expanding = current["macd_hist"] > previous["macd_hist"]
+                price_above_ema50 = len(df) > idx and current["close"] > df.iloc[max(0, idx-50):idx]["close"].mean()
+
+                if not macd_expanding:
+                    return {"signal": "HOLD", "reason": f"MACD histogram fading (ADX={adx:.1f})"}
+                if not price_above_ema50:
+                    return {"signal": "HOLD", "reason": f"Price below 50-bar mean (ADX={adx:.1f})"}
+
                 return {"signal": "BUY", "reason": f"Trending BUY (ADX={adx:.1f})",
-                        "order_type": "market", "limit_price": None, "entry_type": "trend"}
+                        "order_type": "market", "limit_price": None, "entry_type": "trend",
+                        "adx": adx, "macd_hist": current["macd_hist"]}
 
             ema_cross_down = (previous["ema_short"] >= previous["ema_long"]
                               and current["ema_short"] < current["ema_long"])
@@ -216,21 +229,6 @@ class Backtester:
             if ema_cross_down and macd_bearish:
                 return {"signal": "SELL", "reason": f"Trending SELL (ADX={adx:.1f})",
                         "order_type": "market", "limit_price": None, "entry_type": "trend"}
-
-        elif is_ranging:
-            rsi = current["rsi"]
-            prev_adx = previous["adx"]
-            adx_rising = adx > prev_adx + 1.0
-
-            if rsi < cfg["rsi_oversold"] and current["close"] <= current["bb_lower"]:
-                if not adx_rising:
-                    return {"signal": "BUY", "reason": f"MR BUY: RSI={rsi:.1f}",
-                            "order_type": "limit", "limit_price": current["bb_lower"],
-                            "entry_type": "mr"}
-
-            elif rsi > cfg["rsi_overbought"] and current["close"] >= current["bb_upper"]:
-                return {"signal": "SELL", "reason": f"MR SELL: RSI={rsi:.1f}",
-                        "order_type": "market", "limit_price": None, "entry_type": "mr"}
 
         return signal
 
@@ -347,21 +345,15 @@ class Backtester:
         base_stop_pct = cfg["trailing_stop_pct"]
         min_hold = cfg.get("min_hold_bars", 2)
 
-        # Increment bars held
         pos.bars_held += 1
 
-        # MR trades use BB lower as stop instead of ATR
-        if pos.entry_type == "mr":
-            if pos.entry_bb_lower > 0 and current_price < pos.entry_bb_lower * 0.98:
-                return "mr_stop"
-        else:
-            # Phase 1: Initial ATR stop (only after minimum hold period)
-            if pos.bars_held > min_hold and pos.entry_atr > 0 and current_price <= pos.entry_price:
-                is_crypto = "/" in symbol
-                atr_mult = cfg.get("atr_risk_multiplier_crypto", 3.5) if is_crypto else cfg.get("atr_risk_multiplier", 3.0)
-                initial_stop = pos.entry_price - (atr_mult * pos.entry_atr)
-                if current_price <= initial_stop:
-                    return "initial_atr_stop"
+        # Phase 1: Initial ATR stop (only after minimum hold period)
+        if pos.bars_held > min_hold and pos.entry_atr > 0 and current_price <= pos.entry_price:
+            is_crypto = "/" in symbol
+            atr_mult = cfg.get("atr_risk_multiplier_crypto", 4.0) if is_crypto else cfg.get("atr_risk_multiplier", 3.5)
+            initial_stop = pos.entry_price - (atr_mult * pos.entry_atr)
+            if current_price <= initial_stop:
+                return "initial_atr_stop"
 
         # Update peak
         if current_price > pos.peak_price:
@@ -383,7 +375,6 @@ class Backtester:
 
     def _close_position(self, symbol: str, price: float, t: datetime, reason: str):
         pos = self.positions[symbol]
-        # Apply slippage on exit
         fill_price = price * (1 - SLIPPAGE_PCT)
         proceeds = pos.qty * fill_price
         cost_basis = pos.qty * pos.entry_price
@@ -394,7 +385,9 @@ class Backtester:
         self.trades.append(Trade(
             symbol=symbol, side="SELL", qty=pos.qty, price=fill_price,
             time=t, entry_type=pos.entry_type, pnl=pnl,
-            hold_hours=hold_hours, exit_reason=reason
+            hold_hours=hold_hours, exit_reason=reason,
+            entry_adx=pos.entry_adx, entry_macd_hist=pos.entry_macd_hist,
+            sector=self._get_sector(symbol),
         ))
         # Record cooldown only for stop-outs
         if reason in ("initial_atr_stop", "trailing_stop"):
@@ -402,23 +395,27 @@ class Backtester:
         del self.positions[symbol]
 
     def _open_position(self, symbol: str, price: float, t: datetime, signal: dict,
-                       qty: float, atr: float, bb_lower: float = 0.0):
-        # Apply slippage on entry
+                       qty: float, atr: float):
         fill_price = price * (1 + SLIPPAGE_PCT)
         cost = qty * fill_price
         if cost > self.cash:
             return False
+
+        entry_adx = signal.get("adx", 0.0)
+        entry_macd_hist = signal.get("macd_hist", 0.0)
 
         self.cash -= cost
         self.positions[symbol] = Position(
             symbol=symbol, qty=qty, entry_price=fill_price,
             entry_time=t, entry_atr=atr,
             entry_type=signal["entry_type"], peak_price=fill_price,
-            entry_bb_lower=bb_lower,
+            entry_adx=entry_adx, entry_macd_hist=entry_macd_hist,
         )
         self.trades.append(Trade(
             symbol=symbol, side="BUY", qty=qty, price=fill_price,
-            time=t, entry_type=signal["entry_type"]
+            time=t, entry_type=signal["entry_type"],
+            entry_adx=entry_adx, entry_macd_hist=entry_macd_hist,
+            sector=self._get_sector(symbol),
         ))
         return True
 
@@ -477,16 +474,6 @@ class Backtester:
                 if stop_reason:
                     self._close_position(symbol, current_price, t, stop_reason)
                     continue
-
-                # MR profit target at BB middle
-                pos = self.positions[symbol]
-                if pos.entry_type == "mr":
-                    ind_df = self._compute_indicators(symbol)
-                    if ind_df is not None and idx < len(ind_df):
-                        bb_middle = ind_df.iloc[idx - 1]["bb_middle"] if idx > 0 else None
-                        if bb_middle and current_price >= bb_middle:
-                            self._close_position(symbol, current_price, t, "mr_target")
-                            continue
 
                 # SELL signal
                 ind_df = self._compute_indicators(symbol)
@@ -552,7 +539,6 @@ class Backtester:
                 bar = ind_df.iloc[idx - 1]  # closed candle
                 price = bar["close"]
                 atr = bar["atr"] if not pd.isna(bar["atr"]) else 0.0
-                bb_lower = bar["bb_lower"] if not pd.isna(bar.get("bb_lower", float("nan"))) else 0.0
 
                 position_value = self._calculate_position_size(atr, price, self.cash)
                 if not market.get("ema21_above_ema50", True):
@@ -569,19 +555,8 @@ class Backtester:
                 if position_value <= 0:
                     continue
 
-                # Limit order fill check: only fill if next bar's low touches limit
-                fill_price = price
-                if signal["order_type"] == "limit":
-                    limit_price = signal["limit_price"]
-                    if idx + 1 >= len(ind_df):
-                        continue
-                    next_bar = ind_df.iloc[idx]
-                    if next_bar["low"] > limit_price:
-                        continue
-                    fill_price = limit_price
-
-                qty = position_value / fill_price
-                if self._open_position(symbol, fill_price, t, signal, qty, atr, bb_lower=bb_lower):
+                qty = position_value / price
+                if self._open_position(symbol, price, t, signal, qty, atr):
                     pos_val += position_value
                     sector_counts[sector] = sector_counts.get(sector, 0) + 1
                     if len(self.positions) >= max_positions:
