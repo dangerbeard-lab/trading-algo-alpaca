@@ -210,15 +210,6 @@ class Backtester:
             macd_bullish = current["macd"] > current["macd_signal"]
 
             if ema_cross_up and macd_bullish and volume_confirmed:
-                # Entry quality filters
-                macd_expanding = current["macd_hist"] > previous["macd_hist"]
-                price_above_ema50 = len(df) > idx and current["close"] > df.iloc[max(0, idx-50):idx]["close"].mean()
-
-                if not macd_expanding:
-                    return {"signal": "HOLD", "reason": f"MACD histogram fading (ADX={adx:.1f})"}
-                if not price_above_ema50:
-                    return {"signal": "HOLD", "reason": f"Price below 50-bar mean (ADX={adx:.1f})"}
-
                 return {"signal": "BUY", "reason": f"Trending BUY (ADX={adx:.1f})",
                         "order_type": "market", "limit_price": None, "entry_type": "trend",
                         "adx": adx, "macd_hist": current["macd_hist"]}
@@ -269,30 +260,36 @@ class Backtester:
                        f"EMA21 {'>' if ema21_above_ema50 else '<'} EMA50"),
         }
 
-    def _check_daily_trend(self, symbol: str, t: datetime) -> Optional[str]:
+    def _check_daily_trend(self, symbol: str, t: datetime) -> dict:
+        """Check daily trend. Returns dict with trend direction and price vs EMA21."""
+        result = {"trend": None, "price_above_ema21": True}
         df = self.bars_daily.get(symbol)
         if df is None or len(df) < 30:
-            return None
+            return result
 
         idx = self._bar_at_or_before(df, t)
         if idx is None or idx < 22:
-            return None
+            return result
 
         sub = df.iloc[:idx + 1].copy()
         ema_21 = TechnicalIndicators.ema(sub["close"], 21)
 
         if len(sub) < 3:
-            return None
+            return result
 
         current_close = sub["close"].iloc[-2]
         ema_now = ema_21.iloc[-2]
         ema_prev = ema_21.iloc[-3]
 
+        price_above = current_close > ema_now
         if current_close > ema_now and ema_now > ema_prev:
-            return "up"
+            trend = "up"
         elif current_close < ema_now and ema_now < ema_prev:
-            return "down"
-        return None
+            trend = "down"
+        else:
+            trend = None
+
+        return {"trend": trend, "price_above_ema21": price_above}
 
     def _calculate_position_size(self, atr: float, price: float, cash: float) -> float:
         cfg = self.config["risk_management"]
@@ -532,8 +529,9 @@ class Backtester:
                 if signal["signal"] != "BUY":
                     continue
 
-                # Daily trend filter
-                if self._check_daily_trend(symbol, t) == "down":
+                # Daily trend filter: require price above daily EMA21
+                daily = self._check_daily_trend(symbol, t)
+                if not daily["price_above_ema21"]:
                     continue
 
                 bar = ind_df.iloc[idx - 1]  # closed candle

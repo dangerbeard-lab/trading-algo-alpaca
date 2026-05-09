@@ -123,6 +123,18 @@ def calculate_metrics(snapshots: List, trades: List, initial_cash: float, benchm
             "total_pnl": sum(t.pnl for t in trades_list),
         }
 
+    # Worst trades (biggest individual losses)
+    worst_trades = sorted(closed_trades, key=lambda t: t.pnl)[:10]
+    worst_list = [{
+        "symbol": t.symbol,
+        "pnl": t.pnl,
+        "time": t.time,
+        "hold_hours": t.hold_hours,
+        "exit_reason": t.exit_reason,
+        "entry_adx": getattr(t, "entry_adx", 0),
+        "sector": getattr(t, "sector", ""),
+    } for t in worst_trades]
+
     return {
         "initial_cash": initial_cash,
         "final_value": final_value,
@@ -142,6 +154,7 @@ def calculate_metrics(snapshots: List, trades: List, initial_cash: float, benchm
         "benchmark_return": benchmark_return,
         "adx_attribution": adx_attribution,
         "sector_attribution": sector_stats,
+        "worst_trades": worst_list,
     }
 
 
@@ -209,6 +222,16 @@ def print_metrics(metrics: dict):
         print(f"  {'Sector':<20} {'N':>5} {'Win%':>8} {'Total PnL':>14}")
         for sec, s in sorted(metrics["sector_attribution"].items(), key=lambda x: x[1]["total_pnl"], reverse=True):
             print(f"  {sec:<20} {s['n']:>5d} {s['win_rate']:>7.1%} ${s['total_pnl']:>13,.2f}")
+
+    if metrics.get("worst_trades"):
+        print("\n" + "-" * 70)
+        print(" WORST TRADES (Biggest Losses)")
+        print("-" * 70)
+        print(f"  {'Symbol':<8} {'Date':<12} {'PnL':>10} {'Hold(h)':>8} {'Exit Reason':<18} {'Sector':<15}")
+        for w in metrics["worst_trades"]:
+            date_str = w["time"].strftime("%Y-%m-%d") if hasattr(w["time"], "strftime") else str(w["time"])[:10]
+            print(f"  {w['symbol']:<8} {date_str:<12} ${w['pnl']:>9,.2f} {w['hold_hours']:>7.1f}h "
+                  f"{w['exit_reason']:<18} {w['sector']:<15}")
 
     if metrics.get("monthly_returns"):
         print("\n" + "-" * 70)

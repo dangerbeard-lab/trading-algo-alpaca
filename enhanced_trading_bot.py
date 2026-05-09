@@ -480,7 +480,7 @@ class EnhancedTradingBot:
     def generate_signal(self, df: pd.DataFrame, symbol: str) -> dict:
         """
         Generate trading signal using CLOSED candles only (fix lookahead bias).
-        Trend-following only: EMA crossover + MACD + entry quality filters.
+        Pure trend-following: EMA crossover + MACD confirmation.
         """
         if len(df) < 4:
             return {'signal': 'HOLD', 'reason': 'Insufficient data'}
@@ -504,17 +504,9 @@ class EnhancedTradingBot:
             macd_bullish = current['macd'] > current['macd_signal']
 
             if ema_cross_up and macd_bullish and volume_confirmed:
-                macd_expanding = current['macd_hist'] > previous['macd_hist']
-                price_above_mean = current['close'] > df['close'].iloc[-52:-2].mean()
-
-                if not macd_expanding:
-                    return {'signal': 'HOLD', 'reason': f'MACD histogram fading (ADX={adx:.1f})'}
-                if not price_above_mean:
-                    return {'signal': 'HOLD', 'reason': f'Price below 50-bar mean (ADX={adx:.1f})'}
-
                 signal = {
                     'signal': 'BUY',
-                    'reason': f'Trending BUY: EMA+MACD+expanding (ADX={adx:.1f})',
+                    'reason': f'Trending BUY: EMA crossover + MACD (ADX={adx:.1f})',
                     'order_type': 'market',
                     'limit_price': None,
                     'entry_type': 'trend'
@@ -796,16 +788,17 @@ class EnhancedTradingBot:
 
         return result
 
-    def check_daily_trend(self, symbol: str) -> Optional[str]:
+    def check_daily_trend(self, symbol: str) -> dict:
         """
         Check the daily trend direction for a symbol.
-        Returns 'up', 'down', or None if data unavailable.
-        Prevents buying 15-min signals against the daily trend.
+        Returns dict with trend direction and whether price is above daily EMA21.
+        Prevents buying stocks that are below their daily moving average.
         """
+        result = {'trend': None, 'price_above_ema21': True}
         try:
             df = self.get_bars(symbol, timeframe='1Day', limit=30)
             if df is None or len(df) < 22:
-                return None
+                return result
 
             df = df.copy()
             close = df['close']
@@ -815,15 +808,18 @@ class EnhancedTradingBot:
             current_ema = ema_21.iloc[-2]
             prev_ema = ema_21.iloc[-3]
 
+            result['price_above_ema21'] = current_close > current_ema
+
             if current_close > current_ema and current_ema > prev_ema:
-                return 'up'
+                result['trend'] = 'up'
             elif current_close < current_ema and current_ema < prev_ema:
-                return 'down'
-            return None  # indeterminate
+                result['trend'] = 'down'
+
+            return result
 
         except Exception as e:
             logger.debug(f"Daily trend check failed for {symbol}: {e}")
-            return None
+            return result
 
     def check_drawdown_circuit_breaker(self, account: dict) -> bool:
         """
@@ -1093,10 +1089,10 @@ class EnhancedTradingBot:
             signal = self.generate_signal(df, symbol)
 
             if signal['signal'] == 'BUY':
-                # DAILY TREND FILTER: Don't buy against daily downtrend
-                daily_trend = self.check_daily_trend(symbol)
-                if daily_trend == 'down':
-                    logger.info(f"Skipping {symbol} BUY: daily trend is DOWN (counter-trend filter)")
+                # DAILY TREND FILTER: Require price above daily 21-EMA
+                daily = self.check_daily_trend(symbol)
+                if not daily['price_above_ema21']:
+                    logger.info(f"Skipping {symbol} BUY: price below daily EMA21 (falling knife filter)")
                     continue
 
                 # FIX: Size positions using CASH, not portfolio_value (avoid margin leverage)
