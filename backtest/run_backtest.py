@@ -54,6 +54,8 @@ def main():
     parser.add_argument("--config", default="config.json", help="Config path")
     parser.add_argument("--download", action="store_true",
                         help="Download data before running")
+    parser.add_argument("--strategy", choices=["v4", "v5"], default="v5",
+                        help="v4=15min trend-following (legacy), v5=daily momentum (default)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     args = parser.parse_args()
 
@@ -74,20 +76,30 @@ def main():
     else:
         end = datetime.now(timezone.utc)
 
-    from backtest.engine import Backtester
     from backtest.metrics import calculate_metrics, print_metrics
 
-    bt = Backtester(args.config, initial_cash=args.cash)
-    bt.load_data(start, end)
-
-    if not bt.bars_15min:
-        logger.error("No 15Min data loaded. Run with --download first.")
-        sys.exit(1)
-
-    bt.run(start, end)
+    if args.strategy == "v4":
+        from backtest.engine import Backtester
+        bt = Backtester(args.config, initial_cash=args.cash)
+        bt.load_data(start, end)
+        if not bt.bars_15min:
+            logger.error("No 15Min data loaded. Run with --download first.")
+            sys.exit(1)
+        bt.run(start, end)
+        snapshots, trades = bt.snapshots, bt.trades
+    else:
+        from backtest.momentum_engine import MomentumBacktester
+        bt = MomentumBacktester(args.config, initial_cash=args.cash)
+        bt.load_data(start, end)
+        if not bt.bars_daily:
+            logger.error("No daily data loaded. Run with --download first.")
+            sys.exit(1)
+        bt.run(start, end)
+        snapshots, trades = bt.snapshots, bt.trades
 
     benchmark = compute_spy_benchmark(start, end)
-    metrics = calculate_metrics(bt.snapshots, bt.trades, args.cash, benchmark_return=benchmark)
+    metrics = calculate_metrics(snapshots, trades, args.cash, benchmark_return=benchmark,
+                                strategy=args.strategy)
     print_metrics(metrics)
 
 

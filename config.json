@@ -11,7 +11,8 @@
     "commodities": ["GLD", "SLV", "PPLT", "URA", "DBA", "UNG", "CPER", "WEAT"],
     "bonds": ["TLT", "IEF", "SHY", "AGG", "HYG", "GOVT"],
     "defensives": ["XLU", "XLP", "VIG", "SCHD"],
-    "etfs": ["SPY", "QQQ", "IWM"]
+    "etfs": ["SPY", "QQQ", "IWM"],
+    "hedges": ["SQQQ", "SH"]
   },
 
   "strategy": {
@@ -31,6 +32,23 @@
     "atr_period": 14,
     "volume_ma_period": 20,
     "volume_confirmation_multiplier": 1.2
+  },
+
+  "momentum": {
+    "breakout_period": 20,
+    "volume_period": 50,
+    "volume_multiplier": 2.0,
+    "ema_filter_period": 50,
+    "rs_period": 20,
+    "rotation_threshold": 0.40,
+    "rotation_days": 5,
+    "trailing_stop_pct": 0.12,
+    "bull_max_positions": 8,
+    "bull_position_pct": 0.10,
+    "chop_max_positions": 4,
+    "chop_position_pct": 0.06,
+    "bear_hedge_pct": 0.15,
+    "hedge_symbol": "SQQQ"
   },
 
   "risk_management": {
